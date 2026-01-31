@@ -20,6 +20,13 @@ if [ -z "$DOMAIN_NAME" ]; then
     exit 1
 fi
 
+# Ask for Admin Password
+read -p "Set Dashboard Password (user: admin): " ADMIN_PASS
+if [ -z "$ADMIN_PASS" ]; then
+    ADMIN_PASS="admin"
+    echo "Default password 'admin' set."
+fi
+
 echo "Installing Nautica on $DOMAIN_NAME..."
 
 # 1. Install Node.js (v20+)
@@ -30,7 +37,7 @@ apt-get install -y nodejs unzip git
 # 2. Install Caddy
 echo "[2/5] Installing Caddy Web Server..."
 apt-get install -y debian-keyring debian-archive-keyring apt-transport-https curl
-curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive- keyring.gpg
+curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
 curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | tee /etc/apt/sources.list.d/caddy-stable.list
 apt-get update
 apt-get install -y caddy
@@ -38,12 +45,27 @@ apt-get install -y caddy
 # 3. Setup Directory
 echo "[3/5] Setting up project files..."
 INSTALL_DIR="/opt/nautica"
+
+# Check if we need to clone (if running from single file)
+if [ ! -f "server.js" ]; then
+    echo "Cloning repository..."
+    git clone https://github.com/2026musik-code/rutevles.git /tmp/nautica_tmp
+    cp -r /tmp/nautica_tmp/* .
+    rm -rf /tmp/nautica_tmp
+fi
+
 mkdir -p $INSTALL_DIR/public
 cp server.js $INSTALL_DIR/
 cp package.json $INSTALL_DIR/
 cp public/index.html $INSTALL_DIR/public/
-echo "[]" > $INSTALL_DIR/users.json # Init DB
-chmod 666 $INSTALL_DIR/users.json
+
+# Init DB
+echo "[]" > $INSTALL_DIR/users.json
+chmod 600 $INSTALL_DIR/users.json # Secure permissions
+
+# Init Config
+echo "{\"adminUser\": \"admin\", \"adminPass\": \"$ADMIN_PASS\"}" > $INSTALL_DIR/config.json
+chmod 600 $INSTALL_DIR/config.json
 
 cd $INSTALL_DIR
 echo "Installing NPM dependencies..."
@@ -87,6 +109,7 @@ echo "============================================="
 echo "   Installation Complete!                    "
 echo "============================================="
 echo "Dashboard: https://$DOMAIN_NAME/"
+echo "Login: admin / $ADMIN_PASS"
 echo "Proxy Protocol: Enabled"
 echo ""
 echo "Manage service: systemctl status nautica"

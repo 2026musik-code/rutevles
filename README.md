@@ -2,99 +2,85 @@
 
 Repository: [https://github.com/2026musik-code/rutevles](https://github.com/2026musik-code/rutevles)
 
-This project is a Node.js port of the [Nautica](https://github.com/FoolVPN-ID/Nautica) Cloudflare Worker script. It allows you to deploy a powerful VLESS/VMess/Trojan/Shadowsocks tunneling server on any Ubuntu VPS, with added support for routing outbound traffic through SOCKS5 or HTTP proxies.
+This is a comprehensive VLESS/VMess/Trojan tunneling server solution for Ubuntu VPS. It features a modern **Web Admin Panel**, **Real User Authentication**, **Outbound Proxy Routing**, and **Automatic HTTPS** via Caddy.
 
-## Features
+## Key Features
 
-*   **Multi-Protocol Support:**
-    *   VLESS (UUID v4)
-    *   VMess (AEAD)
-    *   Trojan
-    *   Shadowsocks
-*   **Outbound Proxy Routing:**
-    *   Route your tunneling traffic through an upstream SOCKS5 or HTTP proxy.
-    *   Hides your VPS IP from the final destination.
-*   **Auto-Installer:**
-    *   Simple bash script to install Node.js, dependencies, and set up a systemd service.
-*   **High Performance:**
-    *   Built on Node.js native `net` and `ws` modules.
+*   **🛡️ Multi-Protocol Support:**
+    *   **VLESS** (UUID v4)
+    *   **VMess** (AEAD)
+    *   **Trojan**
+    *   **Shadowsocks**
+*   **🚀 Outbound Proxy Routing:**
+    *   Route individual user traffic through upstream SOCKS5 or HTTP proxies.
+    *   Hide your VPS IP address from target websites.
+*   **👥 Real User Management:**
+    *   **Web Dashboard:** Create, delete, and manage users easily.
+    *   **Authentication:** Server enforces UUID validation against a local database (`users.json`).
+    *   **Expiry System:** Auto-reject connections from expired accounts.
+*   **🔒 Auto HTTPS:**
+    *   Integrated **Caddy Web Server** automatically provisions and renews Let's Encrypt SSL certificates.
+    *   Serves the Admin Panel and WebSocket tunnels over standard HTTPS (Port 443).
 
 ## Installation
 
-You can install this server on your Ubuntu VPS with a single command.
+**Prerequisites:**
+1.  A VPS running **Ubuntu 20.04** or newer.
+2.  A **Domain Name** pointing to your VPS IP address (A Record).
 
-### Quick Install
+### Quick Install (One-Click)
 
-Connect to your VPS via SSH and run:
+Connect to your VPS via SSH as `root` and run:
 
 ```bash
 wget https://raw.githubusercontent.com/2026musik-code/rutevles/main/install.sh && chmod +x install.sh && ./install.sh
 ```
 
-*(Note: Ensure the repository URL in the command matches where you push this code)*
+**During installation:**
+*   You will be asked to enter your **Domain Name** (e.g., `vpn.example.com`).
+*   The script will install Node.js, Caddy, dependencies, and set up the systemd service automatically.
 
-### Manual Installation
+## Usage Guide
 
-1.  **Install Node.js (v18 or later):**
-    ```bash
-    curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
-    sudo apt-get install -y nodejs
-    ```
+### 1. Accessing the Admin Panel
+Open your browser and navigate to:
+`https://your-domain.com/`
 
-2.  **Clone the Repository:**
-    ```bash
-    git clone https://github.com/2026musik-code/rutevles.git /opt/nautica
-    cd /opt/nautica
-    ```
+You will see the "MyVPN Vault" dashboard.
 
-3.  **Install Dependencies:**
-    ```bash
-    npm install
-    ```
+### 2. Creating an Account
+1.  Click the **(+)** button.
+2.  **Username:** Enter a client name.
+3.  **Protocol:** Choose VLESS, VMess, or Trojan.
+4.  **Duration:** Select validity period.
+5.  **Proxy Route (Optional):**
+    *   To route this user's traffic through a proxy, enter `IP:PORT` (e.g., `1.2.3.4:1080`).
+    *   Select the proxy type: `SOCKS5` or `HTTP`.
+6.  Click **"Buat Akun"**.
 
-4.  **Run the Server:**
-    ```bash
-    sudo node server.js
-    ```
-    *The server runs on port 80 by default.*
+### 3. Connecting Client
+1.  In the dashboard list, click **"Copy"** on the user card.
+2.  Paste the config link (vless://, vmess://, trojan://) into your client app (v2rayNG, Nekoray, etc.).
+3.  Connect!
 
-## Usage & Proxy Routing
+### Proxy Routing Explanation
+When you configure a Proxy Route for a user, the generated config link will look like this:
+*   **Path:** `/PROXY_IP:PORT?proxyType=socks5`
+*   **Mechanism:** Your VPS receives the connection -> Handshakes with the Upstream Proxy -> Forwards traffic to the final destination.
 
-To connect to the server, use your V2Ray/V2Fly/Xray client.
+## Manual Management
 
-### Standard Connection (Direct)
-Connect using your VPS IP and Port 80.
+*   **Restart Server:** `systemctl restart nautica`
+*   **Check Logs:** `journalctl -u nautica -f`
+*   **Database File:** `/opt/nautica/users.json`
+*   **Web Config:** `/etc/caddy/Caddyfile`
 
-### Connection via Proxy (The "Rute" Feature)
+## Troubleshooting
 
-You can route your traffic through an upstream proxy by modifying the **Path** in your client configuration.
+**Q: Can't access dashboard?**
+*   Check if port 80/443 is open in your firewall (`ufw allow 80`, `ufw allow 443`).
+*   Ensure your domain DNS has propagated.
 
-**Format:**
-```
-/PROXY_IP:PROXY_PORT?proxyType=TYPE
-```
-
-*   **PROXY_IP**: The IP address of the upstream proxy.
-*   **PROXY_PORT**: The port of the upstream proxy.
-*   **TYPE**: `socks5` or `http`.
-
-**Examples:**
-
-1.  **Route through a SOCKS5 Proxy at 1.2.3.4:1080:**
-    *   **Path:** `/1.2.3.4:1080?proxyType=socks5`
-
-2.  **Route through an HTTP Proxy at 5.6.7.8:8080:**
-    *   **Path:** `/5.6.7.8:8080?proxyType=http`
-
-3.  **Legacy Relay Mode (No Handshake / Direct Relay):**
-    *   **Path:** `/1.2.3.4:80`
-    *   *(If `proxyType` is omitted, it attempts to connect directly to the target IP provided in the path, acting as a simple relay)*.
-
-## Service Management
-
-If installed via `install.sh`, the server runs as a systemd service named `nautica`.
-
-*   **Check Status:** `systemctl status nautica`
-*   **Restart:** `systemctl restart nautica`
-*   **Stop:** `systemctl stop nautica`
-*   **Logs:** `journalctl -u nautica -f`
+**Q: Connection failed?**
+*   Check server logs: `journalctl -u nautica -f`
+*   Ensure the client time matches the server time (VMess requirement).

@@ -357,11 +357,11 @@
             <div class="grid-dashboard">
                 <div class="card">
                     <div class="card-title">Total Akun</div>
-                    <div class="card-value" id="total-accounts">3</div>
+                    <div class="card-value" id="total-accounts">0</div>
                 </div>
                 <div class="card">
                     <div class="card-title">Aktif Sekarang</div>
-                    <div class="card-value" style="color: var(--success)">3</div>
+                    <div class="card-value" style="color: var(--success)">0</div>
                 </div>
                 <div class="card">
                     <div class="card-title">Expired dalam 7 Hari</div>
@@ -375,22 +375,7 @@
             </div>
 
             <div class="config-grid" id="account-list">
-                <!-- Example Default Accounts -->
-                <div class="config-card">
-                    <div class="config-header">
-                        <div class="server-name">TestUser 01</div>
-                        <span class="protocol-badge protocol-vless">VLESS</span>
-                    </div>
-                    <div class="config-details">
-                        <div><i class="fa-solid fa-fingerprint" style="width:15px"></i> UUID: a1b2c3...4d5e</div>
-                        <div><i class="fa-regular fa-clock" style="width:15px"></i> Exp: 30 Hari</div>
-                        <div><i class="fa-solid fa-globe" style="width:15px"></i> IP: 127.0.0.1</div>
-                    </div>
-                    <div class="config-actions">
-                        <button class="btn btn-primary" onclick="copyConfig('Vless01')"><i class="fa-regular fa-copy"></i> Copy</button>
-                        <button class="btn btn-danger" onclick="deleteAccount(this)"><i class="fa-solid fa-trash"></i></button>
-                    </div>
-                </div>
+                <!-- Loaded from API -->
             </div>
 
         </main>
@@ -427,7 +412,17 @@
                         <option value="365">1 Tahun</option>
                     </select>
                 </div>
-                <!-- Auto generated UUID visual only -->
+
+                <!-- PROXY INPUT ADDED HERE -->
+                <div class="form-group">
+                    <label>Proxy Route (Optional)</label>
+                    <input type="text" id="proxyRoute" placeholder="Contoh: 1.2.3.4:1080">
+                    <select id="proxyType" style="margin-top: 5px;">
+                        <option value="socks5">SOCKS5</option>
+                        <option value="http">HTTP</option>
+                    </select>
+                </div>
+
                 <div class="form-group">
                     <label>UUID (Auto Generated)</label>
                     <input type="text" id="uuidDisplay" readonly style="color: var(--text-dim); cursor: not-allowed;">
@@ -444,6 +439,12 @@
     <div id="toast-container"></div>
 
     <script>
+        // API Base URL (Relative)
+        const API_URL = '/api/users';
+
+        // Load users on start
+        window.addEventListener('DOMContentLoaded', loadUsers);
+
         // --- Three.js BG (Simple Particles) ---
         const canvas = document.querySelector('#bg-canvas');
         const renderer = new THREE.WebGLRenderer({ canvas, alpha: true });
@@ -470,7 +471,6 @@
 
         // --- Logic Aplikasi ---
 
-        // Generate UUID Random
         function generateUUID() {
             return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
                 var r = Math.random() * 16 | 0, v = c == 'x' ? r : (r & 0x3 | 0x8);
@@ -478,12 +478,11 @@
             });
         }
 
-        // Modal Controls
         const modal = document.getElementById('createModal');
         const uuidInput = document.getElementById('uuidDisplay');
 
         function openModal() {
-            uuidInput.value = generateUUID(); // Generate new UUID saat buka modal
+            uuidInput.value = generateUUID();
             modal.classList.add('active');
         }
 
@@ -492,12 +491,10 @@
             document.getElementById('createForm').reset();
         }
 
-        // Close modal if click outside
         modal.addEventListener('click', (e) => {
             if (e.target === modal) closeModal();
         });
 
-        // Toast Notification
         function showToast(msg, type = 'success') {
             const container = document.getElementById('toast-container');
             const toast = document.createElement('div');
@@ -512,76 +509,131 @@
             }, 3000);
         }
 
-        // Create Account Logic
-        function createAccount(e) {
+        // --- REAL API INTEGRATION ---
+
+        async function loadUsers() {
+            try {
+                const res = await fetch(API_URL);
+                const users = await res.json();
+                renderUserList(users);
+                updateStats(users);
+            } catch (err) {
+                showToast("Gagal memuat data", "error");
+            }
+        }
+
+        function renderUserList(users) {
+            const list = document.getElementById('account-list');
+            list.innerHTML = '';
+
+            users.forEach(user => {
+                let badgeClass = '';
+                if(user.protocol === 'vless') badgeClass = 'protocol-vless';
+                else if(user.protocol === 'vmess') badgeClass = 'protocol-vmess';
+                else badgeClass = 'protocol-trojan';
+
+                const card = document.createElement('div');
+                card.className = 'config-card';
+                card.innerHTML = `
+                    <div class="config-header">
+                        <div class="server-name">${user.username}</div>
+                        <span class="protocol-badge ${badgeClass}">${user.protocol.toUpperCase()}</span>
+                    </div>
+                    <div class="config-details">
+                        <div><i class="fa-solid fa-fingerprint" style="width:15px"></i> UUID: ${user.uuid.substring(0,8)}...</div>
+                        <div><i class="fa-regular fa-clock" style="width:15px"></i> Exp: ${user.days} Hari (${new Date(user.expiredDate).toLocaleDateString()})</div>
+                        ${user.proxyRoute ? `<div><i class="fa-solid fa-route" style="width:15px"></i> Proxy: ${user.proxyRoute} (${user.proxyType})</div>` : ''}
+                        <div><i class="fa-solid fa-globe" style="width:15px"></i> Status: <span style="color:var(--success)">Aktif</span></div>
+                    </div>
+                    <div class="config-actions">
+                        <button class="btn btn-primary" onclick="copyConfig('${user.uuid}', '${user.protocol}', '${user.username}', '${user.proxyRoute}', '${user.proxyType}')"><i class="fa-regular fa-copy"></i> Copy</button>
+                        <button class="btn btn-danger" onclick="deleteAccount('${user.uuid}')"><i class="fa-solid fa-trash"></i></button>
+                    </div>
+                `;
+                list.appendChild(card);
+            });
+        }
+
+        async function createAccount(e) {
             e.preventDefault();
 
             const username = document.getElementById('username').value;
             const protocol = document.getElementById('protocol').value;
             const days = document.getElementById('duration').value;
             const uuid = document.getElementById('uuidDisplay').value;
+            const proxyRoute = document.getElementById('proxyRoute').value;
+            const proxyType = document.getElementById('proxyType').value;
 
-            // Hitung tanggal expired
             const date = new Date();
             date.setDate(date.getDate() + parseInt(days));
-            const expiredDate = date.toLocaleDateString('id-ID', { day: 'numeric', month: 'short', year: 'numeric' });
 
-            // Tentukan style badge
-            let badgeClass = '';
-            if(protocol === 'vless') badgeClass = 'protocol-vless';
-            else if(protocol === 'vmess') badgeClass = 'protocol-vmess';
-            else badgeClass = 'protocol-trojan';
+            const newUser = {
+                username, protocol, days, uuid, proxyRoute, proxyType,
+                expiredDate: date.toISOString()
+            };
 
-            // Buat HTML Element baru
-            const card = document.createElement('div');
-            card.className = 'config-card';
-            card.innerHTML = `
-                <div class="config-header">
-                    <div class="server-name">${username}</div>
-                    <span class="protocol-badge ${badgeClass}">${protocol.toUpperCase()}</span>
-                </div>
-                <div class="config-details">
-                    <div><i class="fa-solid fa-fingerprint" style="width:15px"></i> UUID: ${uuid.substring(0,8)}...</div>
-                    <div><i class="fa-regular fa-clock" style="width:15px"></i> Exp: ${days} Hari (${expiredDate})</div>
-                    <div><i class="fa-solid fa-globe" style="width:15px"></i> Status: <span style="color:var(--success)">Aktif</span></div>
-                </div>
-                <div class="config-actions">
-                    <button class="btn btn-primary" onclick="copyConfig('${username}')"><i class="fa-regular fa-copy"></i> Copy</button>
-                    <button class="btn btn-danger" onclick="deleteAccount(this)"><i class="fa-solid fa-trash"></i></button>
-                </div>
-            `;
+            try {
+                const res = await fetch(API_URL, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(newUser)
+                });
 
-            // Masukkan ke list (prepend agar di atas)
-            const list = document.getElementById('account-list');
-            list.insertBefore(card, list.firstChild);
-
-            // Update Stats
-            const totalEl = document.getElementById('total-accounts');
-            totalEl.innerText = parseInt(totalEl.innerText) + 1;
-
-            showToast('Akun berhasil dibuat!');
-            closeModal();
-        }
-
-        // Delete Logic
-        function deleteAccount(btn) {
-            if(confirm('Hapus akun ini?')) {
-                const card = btn.closest('.config-card');
-                card.style.opacity = '0';
-                card.style.transform = 'scale(0.9)';
-                setTimeout(() => {
-                    card.remove();
-                    // Update stats
-                    const totalEl = document.getElementById('total-accounts');
-                    totalEl.innerText = parseInt(totalEl.innerText) - 1;
-                    showToast('Akun dihapus', 'error');
-                }, 300);
+                if (res.ok) {
+                    showToast('Akun berhasil dibuat!');
+                    closeModal();
+                    loadUsers();
+                } else {
+                    showToast('Gagal membuat akun', 'error');
+                }
+            } catch (err) {
+                showToast('Error koneksi', 'error');
             }
         }
 
-        function copyConfig(name) {
-            navigator.clipboard.writeText(`config-for-${name}-generated`).then(() => {
-                showToast(`Config ${name} disalin`);
+        async function deleteAccount(uuid) {
+            if(confirm('Hapus akun ini?')) {
+                try {
+                    await fetch(`${API_URL}/${uuid}`, { method: 'DELETE' });
+                    showToast('Akun dihapus');
+                    loadUsers();
+                } catch (err) {
+                    showToast('Gagal menghapus', 'error');
+                }
+            }
+        }
+
+        function updateStats(users) {
+            document.getElementById('total-accounts').innerText = users.length;
+            document.getElementById('total-accounts').nextElementSibling.nextElementSibling.innerText = users.length; // Active same as total for now
+        }
+
+        function copyConfig(uuid, protocol, username, proxyRoute, proxyType) {
+            const host = window.location.hostname;
+            const port = 443; // Default TLS
+            let path = '/';
+
+            // Construct Path with Proxy Logic
+            if (proxyRoute) {
+                path = `/${proxyRoute}?proxyType=${proxyType}`;
+            } else {
+                path = `/${host}:80`; // Default relay fallback or just direct
+            }
+
+            let link = '';
+            if (protocol === 'vless') {
+                link = `vless://${uuid}@${host}:${port}?encryption=none&security=tls&type=ws&host=${host}&path=${encodeURIComponent(path)}#${encodeURIComponent(username)}`;
+            } else if (protocol === 'vmess') {
+                const vmessJson = {
+                    v: "2", ps: username, add: host, port: port, id: uuid, aid: "0", scy: "auto", net: "ws", type: "none", host: host, path: path, tls: "tls"
+                };
+                link = `vmess://${btoa(JSON.stringify(vmessJson))}`;
+            } else if (protocol === 'trojan') {
+                link = `trojan://${uuid}@${host}:${port}?security=tls&type=ws&host=${host}&path=${encodeURIComponent(path)}#${encodeURIComponent(username)}`;
+            }
+
+            navigator.clipboard.writeText(link).then(() => {
+                showToast(`Config ${username} disalin`);
             });
         }
     </script>

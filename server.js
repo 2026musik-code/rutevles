@@ -1,7 +1,7 @@
 const http = require('http');
 const net = require('net');
 const WebSocket = require('ws');
-const { webcrypto } = require('crypto');
+const { webcrypto, createHash } = require('crypto');
 const crypto = webcrypto;
 
 // Variables
@@ -187,8 +187,21 @@ const server = http.createServer(async (req, res) => {
             }
         }
 
-        res.writeHead(200, {'Content-Type': 'text/plain'});
-        res.end("Nautica Node.js Server Running");
+        // Basic camouflage fallback
+        const targetReversePrx = process.env.REVERSE_PRX_TARGET || "example.com";
+        try {
+            const proxyRes = await fetch(`https://${targetReversePrx}${req.url}`, {
+                method: req.method,
+                headers: req.headers,
+                // Pass body if POST? For now simple GET proxy
+            });
+            res.writeHead(proxyRes.status, proxyRes.headers);
+            const arrayBuffer = await proxyRes.arrayBuffer();
+            res.end(Buffer.from(arrayBuffer));
+        } catch(e) {
+            res.writeHead(200, {'Content-Type': 'text/plain'});
+            res.end("Nautica Node.js Server Running");
+        }
 
     } catch (err) {
         res.writeHead(500);
@@ -475,7 +488,6 @@ async function handleUDPOutbound(targetAddress, targetPort, dataChunk, webSocket
     try {
         const socket = await connectTarget();
 
-        // Write initial packet
         const header = `udp:${targetAddress}:${targetPort}`;
         const headerBuffer = Buffer.from(header);
         const separator = Buffer.from([0x7c]);
@@ -487,8 +499,8 @@ async function handleUDPOutbound(targetAddress, targetPort, dataChunk, webSocket
         }
 
         wsStream.resume();
-        wsStream.pipe(socket); // Send further UDP chunks from client to Relay
-        socket.pipe(wsStream); // Relay back to client
+        wsStream.pipe(socket);
+        socket.pipe(wsStream);
 
         socket.on('error', (e) => log("UDP Relay Error", e.message));
         socket.on('close', () => log("UDP Relay Closed"));
@@ -624,6 +636,60 @@ function readNekoHeader(buffer) {
     };
 }
 
+function readSsHeader(ssBuffer) {
+  const view = ssBuffer;
+
+  const addressType = view[0];
+  let addressLength = 0;
+  let addressValueIndex = 1;
+  let addressValue = "";
+
+  switch (addressType) {
+    case 1:
+      addressLength = 4;
+      addressValue = view.slice(addressValueIndex, addressValueIndex + addressLength).join(".");
+      break;
+    case 3:
+      addressLength = view[addressValueIndex];
+      addressValueIndex += 1;
+      addressValue = view.slice(addressValueIndex, addressValueIndex + addressLength).toString();
+      break;
+    case 4:
+      addressLength = 16;
+      const ipv6 = [];
+      for (let i = 0; i < 8; i++) {
+        ipv6.push(view.readUInt16BE(addressValueIndex + i * 2).toString(16));
+      }
+      addressValue = ipv6.join(":");
+      break;
+    default:
+      return {
+        hasError: true,
+        message: `Invalid addressType for SS: ${addressType}`,
+      };
+  }
+
+  if (!addressValue) {
+    return {
+      hasError: true,
+      message: `Destination address empty, address type is: ${addressType}`,
+    };
+  }
+
+  const portIndex = addressValueIndex + addressLength;
+  const portRemote = view.readUInt16BE(portIndex);
+  return {
+    hasError: false,
+    addressRemote: addressValue,
+    addressType: addressType,
+    portRemote: portRemote,
+    rawDataIndex: portIndex + 2,
+    rawClientData: ssBuffer.slice(portIndex + 2),
+    version: null,
+    isUDP: portRemote == 53,
+  };
+}
+
 async function readStreamHeader(buffer) {
     try {
         const uuidString = "00000000-0000-0000-0000-000000000000";
@@ -740,14 +806,8 @@ async function generateStreamResponseHeader(responseOptions, encKey, encIv) {
 }
 
 async function md5(...inputs) {
-  const combined = new Uint8Array(inputs.reduce((acc, input) => acc + input.length, 0));
-  let offset = 0;
-  for (const input of inputs) {
-    combined.set(new Uint8Array(input), offset);
-    offset += input.length;
-  }
-  const hashBuffer = await crypto.subtle.digest("MD5", combined);
-  return new Uint8Array(hashBuffer);
+  const combined = Buffer.concat(inputs.map(i => Buffer.from(i)));
+  return new Uint8Array(createHash('md5').update(combined).digest());
 }
 
 async function sha256(input) {

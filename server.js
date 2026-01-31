@@ -1,6 +1,8 @@
 const http = require('http');
 const net = require('net');
 const WebSocket = require('ws');
+const fs = require('fs');
+const path = require('path');
 const { webcrypto, createHash } = require('crypto');
 const crypto = webcrypto;
 
@@ -99,6 +101,22 @@ const server = http.createServer(async (req, res) => {
             return;
         }
 
+        // --- Serve Static Files (Frontend) ---
+        if (url.pathname === '/' || url.pathname === '/index.html') {
+            fs.readFile(path.join(__dirname, 'public', 'index.html'), (err, content) => {
+                if (err) {
+                    res.writeHead(500);
+                    res.end('Error loading dashboard');
+                } else {
+                    res.writeHead(200, { 'Content-Type': 'text/html' });
+                    res.end(content);
+                }
+            });
+            return;
+        }
+
+        // --- API & Logic ---
+
         if (url.pathname.startsWith("/sub")) {
             res.writeHead(301, { 'Location': SUB_PAGE_URL + `?host=${APP_DOMAIN}` });
             res.end();
@@ -187,21 +205,29 @@ const server = http.createServer(async (req, res) => {
             }
         }
 
-        // Basic camouflage fallback
-        const targetReversePrx = process.env.REVERSE_PRX_TARGET || "example.com";
-        try {
-            const proxyRes = await fetch(`https://${targetReversePrx}${req.url}`, {
-                method: req.method,
-                headers: req.headers,
-                // Pass body if POST? For now simple GET proxy
-            });
-            res.writeHead(proxyRes.status, proxyRes.headers);
-            const arrayBuffer = await proxyRes.arrayBuffer();
-            res.end(Buffer.from(arrayBuffer));
-        } catch(e) {
-            res.writeHead(200, {'Content-Type': 'text/plain'});
-            res.end("Nautica Node.js Server Running");
+        // Basic camouflage / 404 for other files
+        // If file exists in public, serve it? (Simple static server logic)
+        const filePath = path.join(__dirname, 'public', url.pathname);
+        if (fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
+             // Basic mime types
+             const ext = path.extname(filePath);
+             const mime = {
+                 '.html': 'text/html',
+                 '.css': 'text/css',
+                 '.js': 'text/javascript',
+                 '.png': 'image/png',
+                 '.jpg': 'image/jpeg',
+                 '.ico': 'image/x-icon'
+             }[ext] || 'application/octet-stream';
+
+             res.writeHead(200, { 'Content-Type': mime });
+             fs.createReadStream(filePath).pipe(res);
+             return;
         }
+
+        // Fallback
+        res.writeHead(404, {'Content-Type': 'text/plain'});
+        res.end("Not Found");
 
     } catch (err) {
         res.writeHead(500);

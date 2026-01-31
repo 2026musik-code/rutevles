@@ -11,9 +11,10 @@ sudo apt-get install -y nodejs
 
 # 2. Setup Directory
 INSTALL_DIR="/opt/nautica"
-mkdir -p $INSTALL_DIR
+mkdir -p $INSTALL_DIR/public
 cp server.js $INSTALL_DIR/
 cp package.json $INSTALL_DIR/
+cp public/index.html $INSTALL_DIR/public/
 
 cd $INSTALL_DIR
 
@@ -48,4 +49,5 @@ systemctl restart nautica
 
 echo "Installation Complete!"
 echo "Server is running on port 80."
+echo "Dashboard available at: http://YOUR_VPS_IP/"
 echo "Check status with: systemctl status nautica"

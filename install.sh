@@ -4,7 +4,7 @@
 # This script creates all necessary files locally and sets up the environment.
 
 echo "============================================="
-echo "   Nautica VLESS/VMess/Trojan Setup Script   "
+echo "   RUTE PREMIUM Auto-Installer               "
 echo "   (Local File Generation Version)           "
 echo "============================================="
 
@@ -28,7 +28,7 @@ if [ -z "$ADMIN_PASS" ]; then
     echo "Default password 'admin' set."
 fi
 
-# 1. Install Node.js (v20+) & Caddy
+# 1. Install Node.js (v20+) & Caddy & Git
 echo "[1/4] Installing dependencies..."
 curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
 apt-get install -y debian-keyring debian-archive-keyring apt-transport-https curl nodejs unzip git
@@ -70,12 +70,13 @@ const WebSocket = require('ws');
 const fs = require('fs');
 const path = require('path');
 const { webcrypto, createHash, randomUUID } = require('crypto');
+const { exec } = require('child_process');
 const crypto = webcrypto;
 
-// --- Config & State ---
 const DB_FILE = path.join(__dirname, 'users.json');
 const CONFIG_FILE = path.join(__dirname, 'config.json');
 const SESSIONS = new Map();
+const ACTIVE_CONNS = new Map(); // uuid -> count
 
 const horse = "dHJvamFu";
 const flash = "dm1lc3M=";
@@ -93,7 +94,6 @@ const CORS_HEADER_OPTIONS = {
   "Access-Control-Allow-Headers": "Content-Type, Authorization"
 };
 
-// --- Crypto Constants (Base64) ---
 const SALT_A1 = atob("Vk1lc3MgSGVhZGVyIEFFQUQgS2V5X0xlbmd0aA==");
 const SALT_A2 = atob("Vk1lc3MgSGVhZGVyIEFFQUQgTm9uY2VfTGVuZ3Ro");
 const SALT_A3 = atob("Vk1lc3MgSGVhZGVyIEFFQUQgS2V5");
@@ -105,46 +105,40 @@ const SALT_B4 = atob("QUVBRCBSZXNwIEhlYWRlciBJVg==");
 
 const PORT = process.env.PORT || 80;
 
-// --- Helpers ---
 function atob(str) { return Buffer.from(str, 'base64').toString('binary'); }
 function btoa(str) { return Buffer.from(str, 'binary').toString('base64'); }
-function arrayBufferToHex(buffer) {
-    return [...new Uint8Array(buffer)].map(x => x.toString(16).padStart(2, '0')).join('');
-}
+function arrayBufferToHex(buf) { return Buffer.from(buf).toString('hex'); }
 
 function getUsers() {
     if (!fs.existsSync(DB_FILE)) return [];
-    try { return JSON.parse(fs.readFileSync(DB_FILE, 'utf8')); } catch { return []; }
+    try {
+        const users = JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
+        // Inject active status
+        return users.map(u => ({
+            ...u,
+            status: (ACTIVE_CONNS.get(u.uuid) || 0) > 0 ? 'online' : 'offline'
+        }));
+    } catch { return []; }
 }
 
 function saveUser(user) {
-    const users = getUsers();
+    const users = getUsers().map(u => { delete u.status; return u; }); // remove status before save
     users.unshift(user);
     fs.writeFileSync(DB_FILE, JSON.stringify(users, null, 2));
 }
 
 function deleteUser(uuid) {
-    const users = getUsers().filter(u => u.uuid !== uuid);
+    const users = getUsers().filter(u => u.uuid !== uuid).map(u => { delete u.status; return u; });
     fs.writeFileSync(DB_FILE, JSON.stringify(users, null, 2));
 }
 
 function isValidUser(uuid) {
     const users = getUsers();
-    // Normalize UUID: remove dashes, lowercase
-    const norm = uuid.replace(/-/g, '').toLowerCase();
-    const user = users.find(u => u.uuid.replace(/-/g, '').toLowerCase() === norm);
+    const user = users.find(u => u.uuid === uuid);
     if (!user) return false;
     const expDate = new Date(user.expiredDate);
     if (new Date() > expDate) return false;
     return true;
-}
-
-function isValidTrojanUser(hash) {
-    const users = getUsers().filter(u => u.protocol === 'trojan');
-    for (const u of users) {
-        if (createHash('sha224').update(u.uuid).digest('hex') === hash) return true;
-    }
-    return false;
 }
 
 function getAdminCredentials() {
@@ -152,7 +146,6 @@ function getAdminCredentials() {
     try { return JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')); } catch { return { adminUser: 'admin', adminPass: 'admin' }; }
 }
 
-// --- HTTP Server (Auth & Dashboard) ---
 const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, `http://${req.headers.host}`);
 
@@ -181,14 +174,49 @@ const server = http.createServer(async (req, res) => {
         return;
     }
 
+    // API: Update System
+    if (url.pathname === '/api/update' && req.method === 'POST') {
+        const cookieHeader = req.headers.cookie;
+        let isAuthenticated = false;
+        if (cookieHeader) {
+            const cookies = cookieHeader.split(';').reduce((acc, c) => {
+                const [n, v] = c.trim().split('='); acc[n] = v; return acc;
+            }, {});
+            if (cookies.session_token && SESSIONS.has(cookies.session_token)) isAuthenticated = true;
+        }
+
+        if(!isAuthenticated) {
+            res.writeHead(401);
+            res.end("Unauthorized");
+            return;
+        }
+
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        // Execute git pull and restart
+        exec('git pull origin main', { cwd: __dirname }, (err, stdout, stderr) => {
+            if (err) {
+                console.error(err);
+                res.end(JSON.stringify({ success: false, message: stderr }));
+                return;
+            }
+            console.log(stdout);
+            res.end(JSON.stringify({ success: true, message: "Update successful. Restarting..." }));
+            setTimeout(() => {
+                process.exit(0); // Systemd will restart it
+            }, 1000);
+        });
+        return;
+    }
+
     if (req.method === 'OPTIONS') {
         res.writeHead(200, CORS_HEADER_OPTIONS);
         res.end();
         return;
     }
 
-    // Check Auth for protected paths
     const isPublic = url.pathname.startsWith("/check") || url.pathname.startsWith("/sub") || url.pathname === '/login.html';
+
+    // Auth Check
     let isAuthenticated = false;
     const cookieHeader = req.headers.cookie;
     if (cookieHeader) {
@@ -244,7 +272,6 @@ const server = http.createServer(async (req, res) => {
         return;
     }
 
-    // Static Files
     let requestedPath = url.pathname === '/' ? '/index.html' : url.pathname;
     requestedPath = requestedPath.split('?')[0];
     const publicDir = path.join(__dirname, 'public');
@@ -290,14 +317,14 @@ server.on('upgrade', async (request, socket, head) => {
     });
 });
 
-// --- WebSocket & Protocol Logic ---
-
 async function websocketHandler(webSocket, request, prxIP, proxyType) {
+    const wsStream = WebSocket.createWebSocketStream(webSocket);
     const log = (msg) => console.log(`[WS] ${msg}`);
+    let userUuid = null;
 
-    // We rely on 'message' event to get the first chunk (Header)
-    webSocket.once('message', async (chunk) => {
-        // NOTE: chunk is a Buffer in ws
+    wsStream.once('data', async (chunk) => {
+        wsStream.pause();
+
         try {
             const protocol = await protocolSniffer(chunk);
             let protocolHeader;
@@ -310,35 +337,36 @@ async function websocketHandler(webSocket, request, prxIP, proxyType) {
                 protocolHeader = readHorseHeader(chunk);
                 if (!protocolHeader.hasError && isValidTrojanUser(protocolHeader.passwordHash)) {
                     authenticated = true;
+                    // Find uuid for status tracking
+                    const users = getUsers().map(u => { delete u.status; return u; });
+                    const u = users.find(u => u.protocol === 'trojan' && createHash('sha224').update(u.uuid).digest('hex') === protocolHeader.passwordHash);
+                    if (u) userUuid = u.uuid;
                 }
             } else if (protocol === atob(neko)) { // VLESS
                 protocolHeader = readNekoHeader(chunk);
-                // Extract UUID from VLESS header (bytes 1-17)
                 uuid = arrayBufferToHex(chunk.slice(1, 17));
-                // Format: 8-4-4-4-12
                 const formattedUUID = `${uuid.substr(0,8)}-${uuid.substr(8,4)}-${uuid.substr(12,4)}-${uuid.substr(16,4)}-${uuid.substr(20,12)}`;
                 log(`VLESS UUID: ${formattedUUID}`);
-
-                // Nautica validates UUID strictly
                 if (isValidUser(formattedUUID)) {
                     authenticated = true;
+                    userUuid = formattedUUID;
                 } else {
-                    log(`User not found: ${formattedUUID}`);
+                    log(`User not found in DB: ${formattedUUID}`);
                 }
             } else if (protocol === atob(flash)) { // VMess
-                const users = getUsers().filter(u => u.protocol === 'vmess');
-                for (const user of users) {
+                const users = getUsers().map(u => { delete u.status; return u; });
+                const vmessUsers = users.filter(u => u.protocol === 'vmess');
+                for (const user of vmessUsers) {
                     const result = await readStreamHeader(chunk, user.uuid);
                     if (!result.hasError) {
                         protocolHeader = result;
                         authenticated = true;
+                        userUuid = user.uuid;
                         log(`VMess Auth Success: ${user.uuid}`);
                         break;
                     }
                 }
-                if(!authenticated) log("VMess Auth Failed: No matching user");
             } else {
-                log("Unknown Protocol Data: " + chunk.toString('hex').substring(0, 50));
                 throw new Error("Unknown Protocol");
             }
 
@@ -352,7 +380,12 @@ async function websocketHandler(webSocket, request, prxIP, proxyType) {
                 return;
             }
 
-            // Generate VMess response header if needed
+            // Track Connection
+            if (userUuid) {
+                const current = ACTIVE_CONNS.get(userUuid) || 0;
+                ACTIVE_CONNS.set(userUuid, current + 1);
+            }
+
             let responseHeader = protocolHeader.version;
             if (protocol === atob(flash) && protocolHeader.needsResponse) {
                  responseHeader = await generateStreamResponseHeader(
@@ -362,20 +395,18 @@ async function websocketHandler(webSocket, request, prxIP, proxyType) {
                 );
             }
 
-            log(`Connecting to Target: ${protocolHeader.addressRemote}:${protocolHeader.portRemote} (UDP: ${protocolHeader.isUDP})`);
-
-            // Establish Outbound
             if (protocolHeader.isUDP) {
                 await handleUDPOutbound(
                     protocolHeader.addressRemote,
                     protocolHeader.portRemote,
-                    chunk, // Initial packet includes payload for UDP usually
+                    chunk,
                     webSocket,
                     responseHeader,
                     log,
                     RELAY_SERVER_UDP,
                     prxIP,
-                    proxyType
+                    proxyType,
+                    wsStream
                 );
             } else {
                 await handleTCPOutBound(
@@ -386,7 +417,8 @@ async function websocketHandler(webSocket, request, prxIP, proxyType) {
                     responseHeader,
                     log,
                     prxIP,
-                    proxyType
+                    proxyType,
+                    wsStream
                 );
             }
 
@@ -396,14 +428,19 @@ async function websocketHandler(webSocket, request, prxIP, proxyType) {
         }
     });
 
-    webSocket.on('error', (err) => log(`WS Error: ${err.message}`));
+    wsStream.on('error', (err) => log(`Stream Error: ${err.message}`));
+    wsStream.on('close', () => {
+        if (userUuid) {
+            const current = ACTIVE_CONNS.get(userUuid) || 0;
+            if (current > 0) ACTIVE_CONNS.set(userUuid, current - 1);
+        }
+    });
 }
 
-async function handleTCPOutBound(addressRemote, portRemote, rawClientData, webSocket, responseHeader, log, prxIP, proxyType) {
+async function handleTCPOutBound(addressRemote, portRemote, rawClientData, webSocket, responseHeader, log, prxIP, proxyType, wsStream) {
     async function connectTarget(addr, port) {
         if (proxyType) {
             if (!prxIP) throw new Error("ProxyType set but no ProxyIP provided");
-            // Parsing Logic matching Nautica/NodeJS
             let sepIdx = -1;
             if (prxIP.includes('=')) sepIdx = prxIP.lastIndexOf('=');
             else if (prxIP.includes('-')) sepIdx = prxIP.lastIndexOf('-');
@@ -412,9 +449,7 @@ async function handleTCPOutBound(addressRemote, portRemote, rawClientData, webSo
             if (sepIdx === -1) throw new Error("Invalid Proxy IP format");
             const pAddr = prxIP.substring(0, sepIdx);
             const pPort = parseInt(prxIP.substring(sepIdx + 1));
-            if (isNaN(pPort)) throw new Error("Invalid Proxy Port");
 
-            log(`Proxy connect ${pAddr}:${pPort} -> ${addr}:${port}`);
             const socket = net.connect(pPort, pAddr);
             await new Promise((res, rej) => {
                 socket.once('connect', res);
@@ -424,8 +459,7 @@ async function handleTCPOutBound(addressRemote, portRemote, rawClientData, webSo
             if (proxyType === 'http') return await httpProxyConnect(socket, addr, port);
             else return await socks5Connect(socket, addr, port);
         } else {
-             // Relay Mode (Legacy) - Direct connection via "Relay" param
-             if (prxIP && !proxyType) {
+             if (prxIP && !proxyType) { // Relay
                  let sepIdx = -1;
                  if (prxIP.includes('=')) sepIdx = prxIP.lastIndexOf('=');
                  else if (prxIP.includes('-')) sepIdx = prxIP.lastIndexOf('-');
@@ -433,11 +467,9 @@ async function handleTCPOutBound(addressRemote, portRemote, rawClientData, webSo
                  if (sepIdx !== -1) {
                      const pAddr = prxIP.substring(0, sepIdx);
                      const pPort = parseInt(prxIP.substring(sepIdx + 1));
-                     log(`Relay connect ${pAddr}:${pPort} -> ${addr}:${port}`);
                      return { socket: net.connect(pPort, pAddr), leftover: null };
                  }
             }
-            log(`Direct connect ${addr}:${port}`);
             return { socket: net.connect(port, addr), leftover: null };
         }
     }
@@ -445,220 +477,20 @@ async function handleTCPOutBound(addressRemote, portRemote, rawClientData, webSo
     try {
         const { socket: tcpSocket, leftover } = await connectTarget(addressRemote, portRemote);
 
-        // 1. Send Response Header to Client (CRITICAL for VLESS/VMess)
-        if (responseHeader && responseHeader.length > 0) {
-            webSocket.send(responseHeader);
-        }
+        if (responseHeader && responseHeader.length > 0) wsStream.write(Buffer.from(responseHeader));
+        if (leftover && leftover.length > 0) wsStream.write(leftover);
+        if (rawClientData && rawClientData.length > 0) tcpSocket.write(rawClientData);
 
-        // 2. Handle Leftover Data from Proxy Handshake (Client -> Target)
-        // Wait, leftover is from TARGET -> SERVER. We need to send it to Client.
-        if (leftover && leftover.length > 0) {
-            webSocket.send(leftover);
-        }
-
-        // 3. Send Initial Payload to Target
-        if (rawClientData && rawClientData.length > 0) {
-            tcpSocket.write(rawClientData);
-        }
-
-        // 4. Pipe Traffic
-        // WS -> TCP
-        const wsStream = WebSocket.createWebSocketStream(webSocket);
+        wsStream.resume();
         wsStream.pipe(tcpSocket);
-
-        // TCP -> WS
         tcpSocket.pipe(wsStream);
 
         tcpSocket.on('error', (e) => log(`TCP Error: ${e.message}`));
-        tcpSocket.on('close', () => {
-            log("TCP Closed");
-            webSocket.close();
-        });
+        tcpSocket.on('close', () => { log("TCP Closed"); webSocket.close(); });
 
-    } catch (e) {
-        log(`Outbound Failed: ${e.message}`);
-        webSocket.close();
-    }
+    } catch (e) { log(`Outbound Failed: ${e.message}`); webSocket.close(); }
 }
 
-// --- Crypto & Parsing Logic (Strictly from Nautica) ---
-
-async function protocolSniffer(buffer) {
-    // Exact Nautica Logic
-    if (buffer.length >= 62) {
-        const d = buffer.slice(56, 60);
-        if (d[0]===0x0d && d[1]===0x0a) {
-            if (d[2]===0x01 || d[2]===0x03 || d[2]===0x7f) {
-                if (d[3]===0x01 || d[3]===0x03 || d[3]===0x04) return atob(horse);
-            }
-        }
-    }
-    if (buffer.length >= 18) {
-        if (buffer[0] === 0) {
-            // VLESS check UUID
-            const uuid = arrayBufferToHex(buffer.slice(1, 17));
-            if(uuid.match(/^[0-9a-f]{8}[0-9a-f]{4}4[0-9a-f]{3}[89ab][0-9a-f]{3}[0-9a-f]{12}$/i)) return atob(neko);
-        }
-    }
-    if (buffer.length >= 42) {
-        const first = buffer[0];
-        if (first === 0x01 || first === 0x03 || first === 0x04) return "ss"; // Not supporting SS
-        return atob(flash); // VMess
-    }
-    return "ss";
-}
-
-function readHorseHeader(buffer) {
-    const data = buffer.slice(58);
-    if (data.length < 6) return { hasError: true, message: "invalid data" };
-
-    const view = new DataView(data.buffer, data.byteOffset, data.length);
-    const cmd = view.getUint8(0);
-    if (cmd !== 1 && cmd !== 3) return { hasError: true, message: "Unsupported command" };
-
-    const atype = view.getUint8(1);
-    let off = 2;
-    let addr = "";
-    if (atype === 1) { addr = `${view.getUint8(off)}.${view.getUint8(off+1)}.${view.getUint8(off+2)}.${view.getUint8(off+3)}`; off+=4; }
-    else if (atype === 3) { const l = view.getUint8(off); off++; addr = new TextDecoder().decode(data.slice(off, off+l)); off+=l; }
-    else if (atype === 4) { const p=[]; for(let i=0;i<8;i++) p.push(view.getUint16(off+i*2).toString(16)); addr=p.join(":"); off+=16; }
-    else return { hasError: true, message: "Invalid ATYP" };
-
-    const port = view.getUint16(off);
-    return { hasError: false, addressRemote: addr, portRemote: port, isUDP: cmd===3, rawClientData: data.slice(off+2), passwordHash: buffer.slice(0, 56).toString() };
-}
-
-function readNekoHeader(buffer) {
-    const ver = buffer[0];
-    const optLen = buffer[17];
-    const cmd = buffer[18+optLen];
-    const portInd = 18+optLen+1;
-    const port = buffer.readUInt16BE(portInd);
-    const atype = buffer[portInd+2];
-    let off = portInd+3;
-    let addr = "";
-    if (atype === 1) { addr = `${buffer[off]}.${buffer[off+1]}.${buffer[off+2]}.${buffer[off+3]}`; off+=4; }
-    else if (atype === 2) { const l = buffer[off]; off++; addr = buffer.slice(off, off+l).toString(); off+=l; }
-    else if (atype === 3) { const p=[]; for(let i=0;i<8;i++) p.push(buffer.readUInt16BE(off+i*2).toString(16)); addr=p.join(":"); off+=16; }
-
-    return { hasError: false, addressRemote: addr, portRemote: port, isUDP: cmd===2, rawClientData: buffer.slice(off), version: new Uint8Array([ver, 0]) };
-}
-
-async function readStreamHeader(buffer, uuid) {
-    // Exact Nautica Logic
-    try {
-        const uuidBytes = new Uint8Array(uuid.replace(/-/g, "").match(/.{1,2}/g).map(b => parseInt(b, 16)));
-        const authKey = await md5(uuidBytes, new TextEncoder().encode(atob("YzQ4NjE5ZmUtOGYwMi00OWUwLWI5ZTktZWRmNzYzZTE3ZTIx")));
-
-        const authId = buffer.slice(0, 16);
-        const encLen = buffer.slice(16, 34);
-        const nonce = buffer.slice(34, 42);
-
-        const lKey = (await kdf(authKey, [SALT_A1, authId, nonce])).slice(0, 16);
-        const lIv = (await kdf(authKey, [SALT_A2, authId, nonce])).slice(0, 12);
-        const lBytes = await aesGcmDecrypt(lKey, lIv, encLen, authId);
-        const hLen = (lBytes[0] << 8) | lBytes[1];
-
-        const encHead = buffer.slice(42, 42 + hLen + 16);
-        const pKey = (await kdf(authKey, [SALT_A3, authId, nonce])).slice(0, 16);
-        const pIv = (await kdf(authKey, [SALT_A4, authId, nonce])).slice(0, 12);
-        const head = await aesGcmDecrypt(pKey, pIv, encHead, authId);
-
-        // Parse Head
-        const view = new DataView(head.buffer, head.byteOffset, head.length);
-        let off = 0;
-        const ver = view.getUint8(off++);
-        if (ver !== 1) throw new Error("Invalid Version");
-
-        const encIv = head.slice(off, off+16); off+=16;
-        const encKey = head.slice(off, off+16); off+=16;
-        const opts = head.slice(off, off+4); off+=4;
-        const cmd = view.getUint8(off++);
-        const port = view.getUint16(off); off+=2;
-        const atype = view.getUint8(off++);
-        let addr = "";
-        if (atype === 1) { addr = `${view.getUint8(off)}.${view.getUint8(off+1)}.${view.getUint8(off+2)}.${view.getUint8(off+3)}`; off+=4; }
-        else if (atype === 2 || atype === 3) { const l = view.getUint8(off++); addr = new TextDecoder().decode(head.slice(off, off+l)); off+=l; }
-        else if (atype === 4) { const p=[]; for(let i=0;i<8;i++) p.push(view.getUint16(off+i*2).toString(16)); addr=p.join(":"); off+=16; }
-
-        const rawInd = 42 + hLen + 16;
-        return { hasError: false, addressRemote: addr, portRemote: port, isUDP: cmd!==1, rawClientData: buffer.slice(rawInd), version: new Uint8Array([opts[0], 0]), encKey, encIv, needsResponse: true, responseOptions: opts };
-    } catch(e) { return { hasError: true, message: e.message }; }
-}
-
-async function generateStreamResponseHeader(opts, key, iv) {
-    try {
-        // NOTE: In Nautica/Rust, KEY and IV are swapped in the hash input relative to variable names?
-        // const key = sha256(encKey)...
-        // Check Nautica Code:
-        // const key = (await sha256(encKey)).slice(0, 16);
-        // const iv = (await sha256(encIv)).slice(0, 16);
-        const sKey = (await sha256(key)).slice(0, 16);
-        const sIv = (await sha256(iv)).slice(0, 16);
-
-        const rLenKey = (await kdf(sKey, [SALT_B1])).slice(0, 16);
-        const rLenIv = (await kdf(sIv, [SALT_B2])).slice(0, 12);
-        const rLenData = new Uint8Array([0, 4]);
-        const encLen = await aesGcmEncrypt(rLenKey, rLenIv, rLenData, new Uint8Array(0));
-
-        const rHead = new Uint8Array([opts[0], 0, 0, 0]);
-        const rHeadKey = (await kdf(sKey, [SALT_B3])).slice(0, 16);
-        const rHeadIv = (await kdf(sIv, [SALT_B4])).slice(0, 12);
-        const encHead = await aesGcmEncrypt(rHeadKey, rHeadIv, rHead, new Uint8Array(0));
-
-        return Buffer.concat([encLen, encHead]);
-    } catch(e) { return Buffer.alloc(0); }
-}
-
-// --- Crypto Primitives ---
-async function md5(...args) {
-    const combined = Buffer.concat(args.map(a => new Uint8Array(a)));
-    return new Uint8Array(await crypto.subtle.digest("MD5", combined));
-}
-async function sha256(d) { return new Uint8Array(await crypto.subtle.digest("SHA-256", d)); }
-async function aesGcmDecrypt(k, n, d, a) {
-    const key = await crypto.subtle.importKey("raw", k, {name:"AES-GCM"}, false, ["decrypt"]);
-    return new Uint8Array(await crypto.subtle.decrypt({name:"AES-GCM", iv:n, additionalData:a}, key, d));
-}
-async function aesGcmEncrypt(k, n, d, a) {
-    const key = await crypto.subtle.importKey("raw", k, {name:"AES-GCM"}, false, ["encrypt"]);
-    return new Uint8Array(await crypto.subtle.encrypt({name:"AES-GCM", iv:n, additionalData:a}, key, d));
-}
-async function kdf(key, path) {
-    const sha256Hash = async (d) => new Uint8Array(await crypto.subtle.digest("SHA-256", d));
-    const hmacSha256 = async (k, d) => {
-        const key = await crypto.subtle.importKey("raw", k, {name:"HMAC", hash:"SHA-256"}, false, ["sign"]);
-        return new Uint8Array(await crypto.subtle.sign("HMAC", key, d));
-    };
-
-    // Recursive Hash (Mirrors Nautica/v2ray-core)
-    const recursiveHash = async (kBytes, innerFn) => {
-        return async (data) => {
-            const ipad = new Uint8Array(64);
-            const opad = new Uint8Array(64);
-            ipad.set(kBytes.slice(0, 64));
-            opad.set(kBytes.slice(0, 64));
-            for(let i=0; i<64; i++) { ipad[i] ^= 0x36; opad[i] ^= 0x5c; }
-
-            const inner = new Uint8Array(ipad.length + data.length);
-            inner.set(ipad); inner.set(data, ipad.length);
-            const innerRes = await innerFn(inner);
-
-            const outer = new Uint8Array(opad.length + innerRes.length);
-            outer.set(opad); outer.set(innerRes, opad.length);
-            return await innerFn(outer);
-        };
-    };
-
-    let currentFn = await recursiveHash(new TextEncoder().encode("VMess AEAD KDF"), sha256Hash);
-    for (const salt of path) {
-        const saltBytes = typeof salt === 'string' ? new TextEncoder().encode(salt) : new Uint8Array(salt);
-        currentFn = await recursiveHash(saltBytes, currentFn);
-    }
-    return await currentFn(key);
-}
-
-// --- Outbound Handlers (Proxy) ---
 async function socks5Connect(socket, targetAddress, targetPort) {
     return new Promise((resolve, reject) => {
         const onHandshakeError = (err) => reject(err);
@@ -692,7 +524,6 @@ async function socks5Connect(socket, targetAddress, targetPort) {
 
                 let leftover = null;
                 if (data2.length > headerLen) leftover = data2.slice(headerLen);
-
                 resolve({ socket, leftover });
             });
         });
@@ -716,7 +547,7 @@ async function httpProxyConnect(socket, targetAddress, targetPort) {
     });
 }
 
-async function handleUDPOutbound(targetAddress, targetPort, dataChunk, webSocket, responseHeader, log, relay, prxIP, proxyType) {
+async function handleUDPOutbound(targetAddress, targetPort, dataChunk, webSocket, responseHeader, log, relay, prxIP, proxyType, wsStream) {
     async function connectTarget() {
         if (proxyType) {
              if (!prxIP) throw new Error("ProxyType set but no ProxyIP provided");
@@ -741,40 +572,345 @@ async function handleUDPOutbound(targetAddress, targetPort, dataChunk, webSocket
 
     try {
         const socket = await connectTarget();
-        // Send Response Header (VLESS/VMess) before anything else
-        if (responseHeader) webSocket.send(responseHeader);
+        if (responseHeader) wsStream.write(Buffer.from(responseHeader));
 
         const header = `udp:${targetAddress}:${targetPort}`;
         const payload = Buffer.concat([Buffer.from(header), Buffer.from([0x7c]), Buffer.from(dataChunk)]);
         socket.write(payload);
 
-        // Pipe from Socket -> WebSocket
-        socket.on('data', (chunk) => {
-            if (webSocket.readyState === WebSocket.OPEN) webSocket.send(chunk);
-        });
-
-        // Pipe from WebSocket -> Socket (Need to handle frames)
-        webSocket.on('message', (msg) => {
-            if (!socket.destroyed) socket.write(msg);
-        });
-
+        wsStream.resume();
+        wsStream.pipe(socket);
+        socket.pipe(wsStream);
         socket.on('error', (e) => log(`UDP Error: ${e.message}`));
     } catch(e) { webSocket.close(); }
+}
+
+// --- Protocol Parsers (Native Node Logic) ---
+async function protocolSniffer(buffer) {
+    if (buffer.length >= 18 && buffer[0] === 0) return atob(neko);
+    if (buffer.length >= 62) {
+        const d = buffer.slice(56, 60);
+        if (d[0]===0x0d && d[1]===0x0a) return atob(horse);
+    }
+    if (buffer.length >= 42) return atob(flash);
+    return "";
+}
+
+function readHorseHeader(buffer) {
+    if (buffer.length < 58) return { hasError: true };
+    const hash = buffer.slice(0, 56).toString();
+    const data = buffer.slice(58);
+    if (data.length < 6) return { hasError: true };
+
+    const cmd = data[0];
+    const atype = data[1];
+    let off = 2;
+    let addr = "";
+    if (atype === 1) { addr = data.slice(off, off+4).join('.'); off+=4; }
+    else if (atype === 3) { const l = data[off]; off++; addr = data.slice(off, off+l).toString(); off+=l; }
+    else if (atype === 4) { off+=16; addr="ipv6"; }
+    else return { hasError: true };
+
+    const port = data.readUInt16BE(off);
+    return { hasError: false, addressRemote: addr, portRemote: port, isUDP: cmd===3, rawClientData: data.slice(off+2), passwordHash: hash };
+}
+
+function readNekoHeader(buffer) {
+    const ver = buffer[0];
+    const optLen = buffer[17];
+    const cmd = buffer[18+optLen];
+    const portInd = 18+optLen+1;
+    const port = buffer.readUInt16BE(portInd);
+    const atype = buffer[portInd+2];
+    let off = portInd+3;
+    let addr = "";
+    if (atype === 1) { addr = buffer.slice(off, off+4).join('.'); off+=4; }
+    else if (atype === 2) { const l = buffer[off]; off++; addr = buffer.slice(off, off+l).toString(); off+=l; }
+    else if (atype === 3) { off+=16; addr="ipv6"; }
+
+    return { hasError: false, addressRemote: addr, portRemote: port, isUDP: cmd===2, rawClientData: buffer.slice(off), version: new Uint8Array([ver, 0]) };
+}
+
+async function readStreamHeader(buffer, uuid) {
+    try {
+        const keyBytes = new Uint8Array(uuid.replace(/-/g, "").match(/.{1,2}/g).map(b => parseInt(b, 16)));
+        const authKey = await md5(keyBytes, new TextEncoder().encode(atob("YzQ4NjE5ZmUtOGYwMi00OWUwLWI5ZTktZWRmNzYzZTE3ZTIx")));
+        const authId = buffer.slice(0, 16);
+        const encLen = buffer.slice(16, 34);
+        const nonce = buffer.slice(34, 42);
+
+        const lKey = (await kdf(authKey, [SALT_A1, authId, nonce])).slice(0, 16);
+        const lIv = (await kdf(authKey, [SALT_A2, authId, nonce])).slice(0, 12);
+        const lBytes = await aesGcmDecrypt(lKey, lIv, encLen, authId);
+        const hLen = (lBytes[0] << 8) | lBytes[1];
+
+        const encHead = buffer.slice(42, 42 + hLen + 16);
+        const pKey = (await kdf(authKey, [SALT_A3, authId, nonce])).slice(0, 16);
+        const pIv = (await kdf(authKey, [SALT_A4, authId, nonce])).slice(0, 12);
+        const head = await aesGcmDecrypt(pKey, pIv, encHead, authId);
+
+        const view = Buffer.from(head);
+        let off = 0;
+        const ver = view[off++];
+        const encIv = view.slice(off, off+16); off+=16;
+        const encKey = view.slice(off, off+16); off+=16;
+        const opts = view.slice(off, off+4); off+=4;
+        const cmd = view[off++];
+        const port = view.readUInt16BE(off); off+=2;
+        const atype = view[off++];
+        let addr = "";
+        if (atype === 1) { addr = view.slice(off, off+4).join('.'); off+=4; }
+        else if (atype === 2) { const l = view[off++]; addr = view.slice(off, off+l).toString(); off+=l; }
+
+        return { hasError: false, addressRemote: addr, portRemote: port, isUDP: cmd!==1, rawClientData: buffer.slice(42+hLen+16), version: new Uint8Array([opts[0], 0]), encKey, encIv, needsResponse: true, responseOptions: opts };
+    } catch(e) { return { hasError: true, message: e.message }; }
+}
+
+async function generateStreamResponseHeader(opts, key, iv) {
+    try {
+        const sKey = (await sha256(key)).slice(0, 16);
+        const sIv = (await sha256(iv)).slice(0, 16);
+        const rLenKey = (await kdf(sKey, [SALT_B1])).slice(0, 16);
+        const rLenIv = (await kdf(sIv, [SALT_B2])).slice(0, 12);
+        const rLenData = new Uint8Array([0, 4]);
+        const encLen = await aesGcmEncrypt(rLenKey, rLenIv, rLenData, new Uint8Array(0));
+
+        const rHead = new Uint8Array([opts[0], 0, 0, 0]);
+        const rHeadKey = (await kdf(sKey, [SALT_B3])).slice(0, 16);
+        const rHeadIv = (await kdf(sIv, [SALT_B4])).slice(0, 12);
+        const encHead = await aesGcmEncrypt(rHeadKey, rHeadIv, rHead, new Uint8Array(0));
+
+        return Buffer.concat([encLen, encHead]);
+    } catch(e) { return Buffer.alloc(0); }
+}
+
+async function md5(...args) { return new Uint8Array(createHash('md5').update(Buffer.concat(args.map(a=>Buffer.from(a)))).digest()); }
+async function sha256(d) { return new Uint8Array(await crypto.subtle.digest("SHA-256", d)); }
+async function aesGcmDecrypt(k, n, d, a) {
+    const key = await crypto.subtle.importKey("raw", k, {name:"AES-GCM"}, false, ["decrypt"]);
+    return new Uint8Array(await crypto.subtle.decrypt({name:"AES-GCM", iv:n, additionalData:a}, key, d));
+}
+async function aesGcmEncrypt(k, n, d, a) {
+    const key = await crypto.subtle.importKey("raw", k, {name:"AES-GCM"}, false, ["encrypt"]);
+    return new Uint8Array(await crypto.subtle.encrypt({name:"AES-GCM", iv:n, additionalData:a}, key, d));
+}
+async function kdf(key, path) {
+    async function hmac(k, d) {
+        const key = await crypto.subtle.importKey("raw", k, {name:"HMAC", hash:"SHA-256"}, false, ["sign"]);
+        return new Uint8Array(await crypto.subtle.sign("HMAC", key, d));
+    }
+    let result = key;
+    for (const p of path) {
+        result = await hmac(result, p);
+    }
+    return result;
 }
 
 server.listen(PORT, () => { console.log(`Server running on ${PORT}`); });
 EOF
 
-# Generate HTML (Content from previous step)
-# NOTE: Use simple cat, the HTML content has no variable expansion conflict usually but better safe.
-# We will use EOF with quotes to be safe.
+# Generate Login HTML
+cat <<'EOF' > $INSTALL_DIR/public/login.html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RUTE PREMIUM | Login</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #0f172a;
+            color: #f8fafc;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            overflow: hidden;
+        }
+
+        .ambient {
+            position: absolute;
+            width: 100%;
+            height: 100%;
+            z-index: 1;
+            background: radial-gradient(circle at 50% 10%, rgba(59, 130, 246, 0.15) 0%, transparent 60%);
+        }
+
+        .login-card {
+            background-color: #1e293b;
+            border: 1px solid #334155;
+            padding: 40px;
+            border-radius: 16px;
+            width: 100%;
+            max-width: 400px;
+            z-index: 10;
+            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
+            animation: floatUp 0.6s cubic-bezier(0.2, 0.8, 0.2, 1);
+        }
+
+        @keyframes floatUp {
+            from { transform: translateY(20px); opacity: 0; }
+            to { transform: translateY(0); opacity: 1; }
+        }
+
+        .brand {
+            text-align: center;
+            margin-bottom: 8px;
+            font-size: 1.75rem;
+            font-weight: 700;
+            color: #3b82f6;
+            letter-spacing: -0.5px;
+        }
+
+        .subtitle {
+            text-align: center;
+            color: #94a3b8;
+            font-size: 0.9rem;
+            margin-bottom: 32px;
+        }
+
+        .form-group { margin-bottom: 20px; }
+        .form-group label {
+            display: block;
+            margin-bottom: 8px;
+            font-size: 0.85rem;
+            color: #94a3b8;
+        }
+        .form-group input {
+            width: 100%;
+            padding: 12px;
+            border-radius: 8px;
+            background-color: #0f172a;
+            border: 1px solid #334155;
+            color: white;
+            outline: none;
+            transition: border-color 0.2s;
+            font-family: inherit;
+        }
+        .form-group input:focus { border-color: #3b82f6; }
+
+        .btn {
+            width: 100%;
+            padding: 12px;
+            background-color: #3b82f6;
+            color: white;
+            border: none;
+            border-radius: 8px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background-color 0.2s;
+            margin-top: 10px;
+        }
+        .btn:hover { background-color: #2563eb; }
+
+        .error-msg {
+            color: #ef4444;
+            text-align: center;
+            margin-bottom: 20px;
+            font-size: 0.9rem;
+            display: none;
+        }
+
+        .contact-buttons {
+            display: flex;
+            gap: 12px;
+            margin-top: 24px;
+            padding-top: 24px;
+            border-top: 1px solid #334155;
+        }
+
+        .contact-btn {
+            flex: 1;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+            padding: 10px;
+            border-radius: 8px;
+            text-decoration: none;
+            font-size: 0.9rem;
+            font-weight: 500;
+            transition: opacity 0.2s;
+        }
+        .contact-btn:hover { opacity: 0.8; }
+
+        .btn-wa { background-color: #25D366; color: white; }
+        .btn-tg { background-color: #0088cc; color: white; }
+
+    </style>
+</head>
+<body>
+    <div class="ambient"></div>
+    <div class="login-card">
+        <div class="brand">RUTE PREMIUM</div>
+        <div class="subtitle">Secure Tunneling System</div>
+
+        <div id="error" class="error-msg">Invalid credentials</div>
+
+        <form onsubmit="handleLogin(event)">
+            <div class="form-group">
+                <label>Username</label>
+                <input type="text" id="username" required autocomplete="off">
+            </div>
+            <div class="form-group">
+                <label>Password</label>
+                <input type="password" id="password" required>
+            </div>
+            <button type="submit" class="btn">Sign In</button>
+        </form>
+
+        <div class="contact-buttons">
+            <a href="https://wa.me/6287733745059" target="_blank" class="contact-btn btn-wa">
+                <i class="fa-brands fa-whatsapp"></i> WhatsApp
+            </a>
+            <a href="https://t.me/otomotif_digital" target="_blank" class="contact-btn btn-tg">
+                <i class="fa-brands fa-telegram"></i> Telegram
+            </a>
+        </div>
+    </div>
+
+    <script>
+        async function handleLogin(e) {
+            e.preventDefault();
+            const u = document.getElementById('username').value;
+            const p = document.getElementById('password').value;
+            const err = document.getElementById('error');
+
+            try {
+                const res = await fetch('/api/login', {
+                    method: 'POST',
+                    body: JSON.stringify({ username: u, password: p })
+                });
+                const data = await res.json();
+
+                if (data.success) {
+                    window.location.href = '/index.html';
+                } else {
+                    err.style.display = 'block';
+                    err.innerText = data.error || 'Login failed';
+                }
+            } catch {
+                err.style.display = 'block';
+                err.innerText = 'Connection error';
+            }
+        }
+    </script>
+</body>
+</html>
+EOF
+
+# Generate HTML
 cat <<'EOF' > $INSTALL_DIR/public/index.html
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Nautica Admin | VPS Manager</title>
+    <title>RUTE PREMIUM | VPS Manager</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
@@ -891,6 +1027,8 @@ cat <<'EOF' > $INSTALL_DIR/public/index.html
         .btn-primary:hover { background-color: var(--primary-hover); }
         .btn-danger { background-color: rgba(239, 68, 68, 0.1); color: var(--danger); }
         .btn-danger:hover { background-color: rgba(239, 68, 68, 0.2); }
+        .btn-success { background-color: var(--success); color: white; }
+        .btn-success:hover { background-color: #059669; }
         .btn-sm { padding: 6px 12px; font-size: 0.85rem; }
 
         /* Stats Grid */
@@ -981,6 +1119,15 @@ cat <<'EOF' > $INSTALL_DIR/public/index.html
         .badge-vmess { background: rgba(245, 158, 11, 0.1); color: var(--warning); }
         .badge-trojan { background: rgba(59, 130, 246, 0.1); color: var(--primary); }
 
+        .status-dot {
+            display: inline-block;
+            width: 8px; height: 8px;
+            border-radius: 50%;
+            margin-right: 6px;
+        }
+        .status-online { background-color: var(--success); box-shadow: 0 0 8px var(--success); }
+        .status-offline { background-color: var(--text-muted); }
+
         /* Modal */
         .modal-overlay {
             position: fixed;
@@ -1050,13 +1197,14 @@ cat <<'EOF' > $INSTALL_DIR/public/index.html
 
     <nav class="sidebar" id="sidebar">
         <div class="brand">
-            <i class="fa-solid fa-bolt"></i> Nautica
+            <i class="fa-solid fa-bolt"></i> RUTE PREMIUM
         </div>
         <div class="nav-links">
             <a href="#" class="nav-link active"><i class="fa-solid fa-grid-2"></i> Dashboard</a>
             <a href="#" class="nav-link"><i class="fa-solid fa-users"></i> Users</a>
             <a href="#" class="nav-link"><i class="fa-solid fa-network-wired"></i> Proxies</a>
             <div style="margin-top: auto; padding-top: 20px; border-top: 1px solid var(--border);">
+                <a href="#" class="nav-link" onclick="updateSystem()"><i class="fa-solid fa-cloud-arrow-down"></i> Update System</a>
                 <a href="#" class="nav-link" onclick="location.reload()"><i class="fa-solid fa-rotate"></i> Refresh</a>
             </div>
         </div>
@@ -1084,8 +1232,8 @@ cat <<'EOF' > $INSTALL_DIR/public/index.html
                 <div class="stat-value" id="stat-total">0</div>
             </div>
             <div class="stat-card">
-                <div class="stat-label">Active Protocols</div>
-                <div class="stat-value">3</div>
+                <div class="stat-label">Active Users</div>
+                <div class="stat-value" id="stat-active">0</div>
             </div>
             <div class="stat-card">
                 <div class="stat-label">System Status</div>
@@ -1107,6 +1255,7 @@ cat <<'EOF' > $INSTALL_DIR/public/index.html
                 <thead>
                     <tr>
                         <th>Username</th>
+                        <th>Status</th>
                         <th>Protocol</th>
                         <th>UUID / Password</th>
                         <th>Proxy Route</th>
@@ -1173,6 +1322,8 @@ cat <<'EOF' > $INSTALL_DIR/public/index.html
 
         // Init
         document.addEventListener('DOMContentLoaded', loadData);
+        // Poll for status every 5 seconds
+        setInterval(loadData, 5000);
 
         function toggleSidebar() {
             document.getElementById('sidebar').classList.toggle('open');
@@ -1185,18 +1336,36 @@ cat <<'EOF' > $INSTALL_DIR/public/index.html
             document.getElementById('createModal').classList.remove('active');
         }
 
+        async function updateSystem() {
+            if(!confirm("Are you sure you want to update the system from GitHub? The service will restart.")) return;
+            try {
+                showToast("Updating system...", "success");
+                const res = await fetch('/api/update', { method: 'POST' });
+                const data = await res.json();
+                if(data.success) {
+                    showToast(data.message);
+                    setTimeout(() => location.reload(), 3000);
+                } else {
+                    showToast("Update failed: " + data.message, "error");
+                }
+            } catch(e) {
+                showToast("Update error: " + e.message, "error");
+            }
+        }
+
         async function loadData() {
             try {
                 const res = await fetch(API_URL);
                 if (res.status === 401) {
-                    window.location.href = '/login.html'; // Redirect to login
+                    window.location.href = '/login.html';
                     return;
                 }
                 allUsers = await res.json();
                 renderTable(allUsers);
                 document.getElementById('stat-total').innerText = allUsers.length;
+                document.getElementById('stat-active').innerText = allUsers.filter(u => u.status === 'online').length;
             } catch(e) {
-                showToast(e.message, 'error');
+                // Silent error for polling
             }
         }
 
@@ -1205,7 +1374,7 @@ cat <<'EOF' > $INSTALL_DIR/public/index.html
             tbody.innerHTML = '';
 
             if (users.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="6" style="text-align:center; padding: 30px;">No users found.</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="7" style="text-align:center; padding: 30px;">No users found.</td></tr>';
                 return;
             }
 
@@ -1213,9 +1382,12 @@ cat <<'EOF' > $INSTALL_DIR/public/index.html
                 const tr = document.createElement('tr');
                 const expiry = new Date(u.expiredDate).toLocaleDateString();
                 const proxyDisplay = u.proxyRoute ? `<span style="font-family:monospace; font-size:0.8rem; background:var(--bg-input); padding:2px 6px; border-radius:4px;">${u.proxyRoute}</span>` : '<span style="color:var(--text-muted)">Direct</span>';
+                const statusClass = u.status === 'online' ? 'status-online' : 'status-offline';
+                const statusText = u.status === 'online' ? 'Online' : 'Offline';
 
                 tr.innerHTML = `
                     <td><b>${u.username}</b></td>
+                    <td><div style="display:flex; align-items:center;"><span class="status-dot ${statusClass}"></span> ${statusText}</div></td>
                     <td><span class="badge badge-${u.protocol}">${u.protocol.toUpperCase()}</span></td>
                     <td style="font-family: monospace; color: var(--text-muted);">${u.uuid.substring(0,8)}...</td>
                     <td>${proxyDisplay}</td>
@@ -1265,7 +1437,6 @@ cat <<'EOF' > $INSTALL_DIR/public/index.html
             const proxyType = document.getElementById('in_proxy_type').value;
             const days = document.getElementById('in_days').value;
 
-            // Generate UUID
             const uuid = 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
                 const r = Math.random() * 16 | 0, v = c == 'x' ? r : (r & 0x3 | 0x8);
                 return v.toString(16);
@@ -1342,154 +1513,6 @@ cat <<'EOF' > $INSTALL_DIR/public/index.html
 </html>
 EOF
 
-# Generate Login HTML
-cat <<'EOF' > $INSTALL_DIR/public/login.html
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Nautica Admin Login</title>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body {
-            font-family: 'Inter', sans-serif;
-            background-color: #0f172a;
-            color: #f8fafc;
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            height: 100vh;
-            overflow: hidden;
-        }
-
-        /* Ambient Background */
-        .ambient {
-            position: absolute;
-            width: 100%;
-            height: 100%;
-            z-index: 1;
-            background: radial-gradient(circle at 50% 10%, rgba(59, 130, 246, 0.15) 0%, transparent 60%);
-        }
-
-        .login-card {
-            background-color: #1e293b;
-            border: 1px solid #334155;
-            padding: 40px;
-            border-radius: 16px;
-            width: 100%;
-            max-width: 400px;
-            z-index: 10;
-            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
-            animation: floatUp 0.6s cubic-bezier(0.2, 0.8, 0.2, 1);
-        }
-
-        @keyframes floatUp {
-            from { transform: translateY(20px); opacity: 0; }
-            to { transform: translateY(0); opacity: 1; }
-        }
-
-        .brand {
-            text-align: center;
-            margin-bottom: 32px;
-            font-size: 1.75rem;
-            font-weight: 700;
-            color: #3b82f6;
-            letter-spacing: -0.5px;
-        }
-
-        .form-group { margin-bottom: 20px; }
-        .form-group label {
-            display: block;
-            margin-bottom: 8px;
-            font-size: 0.85rem;
-            color: #94a3b8;
-        }
-        .form-group input {
-            width: 100%;
-            padding: 12px;
-            border-radius: 8px;
-            background-color: #0f172a;
-            border: 1px solid #334155;
-            color: white;
-            outline: none;
-            transition: border-color 0.2s;
-            font-family: inherit;
-        }
-        .form-group input:focus { border-color: #3b82f6; }
-
-        .btn {
-            width: 100%;
-            padding: 12px;
-            background-color: #3b82f6;
-            color: white;
-            border: none;
-            border-radius: 8px;
-            font-weight: 600;
-            cursor: pointer;
-            transition: background-color 0.2s;
-            margin-top: 10px;
-        }
-        .btn:hover { background-color: #2563eb; }
-
-        .error-msg {
-            color: #ef4444;
-            text-align: center;
-            margin-bottom: 20px;
-            font-size: 0.9rem;
-            display: none;
-        }
-    </style>
-</head>
-<body>
-    <div class="ambient"></div>
-    <div class="login-card">
-        <div class="brand">Nautica Admin</div>
-        <div id="error" class="error-msg">Invalid credentials</div>
-        <form onsubmit="handleLogin(event)">
-            <div class="form-group">
-                <label>Username</label>
-                <input type="text" id="username" required autocomplete="off">
-            </div>
-            <div class="form-group">
-                <label>Password</label>
-                <input type="password" id="password" required>
-            </div>
-            <button type="submit" class="btn">Sign In</button>
-        </form>
-    </div>
-
-    <script>
-        async function handleLogin(e) {
-            e.preventDefault();
-            const u = document.getElementById('username').value;
-            const p = document.getElementById('password').value;
-            const err = document.getElementById('error');
-
-            try {
-                const res = await fetch('/api/login', {
-                    method: 'POST',
-                    body: JSON.stringify({ username: u, password: p })
-                });
-                const data = await res.json();
-
-                if (data.success) {
-                    window.location.href = '/index.html';
-                } else {
-                    err.style.display = 'block';
-                    err.innerText = data.error || 'Login failed';
-                }
-            } catch {
-                err.style.display = 'block';
-                err.innerText = 'Connection error';
-            }
-        }
-    </script>
-</body>
-</html>
-EOF
-
 # Init DB
 echo "[]" > $INSTALL_DIR/users.json
 chmod 600 $INSTALL_DIR/users.json
@@ -1498,12 +1521,19 @@ chmod 600 $INSTALL_DIR/users.json
 echo "{\"adminUser\": \"admin\", \"adminPass\": \"$ADMIN_PASS\"}" > $INSTALL_DIR/config.json
 chmod 600 $INSTALL_DIR/config.json
 
+# Setup Git for Updates
+echo "[3/4] Initializing Git..."
 cd $INSTALL_DIR
+if [ ! -d ".git" ]; then
+    git init
+    git remote add origin https://github.com/2026musik-code/rutevles
+fi
+
 echo "Installing NPM dependencies..."
 npm install
 
 # 3. Configure Caddy
-echo "[3/4] Configuring Caddy..."
+echo "[4/4] Configuring Caddy..."
 cat <<EOF > /etc/caddy/Caddyfile
 $DOMAIN_NAME {
     reverse_proxy localhost:3000
@@ -1512,7 +1542,7 @@ EOF
 systemctl reload caddy
 
 # 4. Create Service
-echo "[4/4] Creating Systemd service..."
+echo "Creating Systemd service..."
 cat <<EOF > /etc/systemd/system/nautica.service
 [Unit]
 Description=Nautica Tunneling Server
@@ -1541,5 +1571,6 @@ echo "   Installation Complete!                    "
 echo "============================================="
 echo "Dashboard: https://$DOMAIN_NAME/"
 echo "Login: admin / $ADMIN_PASS"
-echo "Proxy Protocol: Enabled"
+echo "Brand: RUTE PREMIUM"
+echo "Updates: Enabled (from GitHub)"
 echo "============================================="

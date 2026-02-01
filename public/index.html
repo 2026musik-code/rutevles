@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Nautica Admin | VPS Manager</title>
+    <title>RUTE PREMIUM | VPS Manager</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
@@ -120,6 +120,8 @@
         .btn-primary:hover { background-color: var(--primary-hover); }
         .btn-danger { background-color: rgba(239, 68, 68, 0.1); color: var(--danger); }
         .btn-danger:hover { background-color: rgba(239, 68, 68, 0.2); }
+        .btn-success { background-color: var(--success); color: white; }
+        .btn-success:hover { background-color: #059669; }
         .btn-sm { padding: 6px 12px; font-size: 0.85rem; }
 
         /* Stats Grid */
@@ -210,6 +212,15 @@
         .badge-vmess { background: rgba(245, 158, 11, 0.1); color: var(--warning); }
         .badge-trojan { background: rgba(59, 130, 246, 0.1); color: var(--primary); }
 
+        .status-dot {
+            display: inline-block;
+            width: 8px; height: 8px;
+            border-radius: 50%;
+            margin-right: 6px;
+        }
+        .status-online { background-color: var(--success); box-shadow: 0 0 8px var(--success); }
+        .status-offline { background-color: var(--text-muted); }
+
         /* Modal */
         .modal-overlay {
             position: fixed;
@@ -279,13 +290,14 @@
 
     <nav class="sidebar" id="sidebar">
         <div class="brand">
-            <i class="fa-solid fa-bolt"></i> Nautica
+            <i class="fa-solid fa-bolt"></i> RUTE PREMIUM
         </div>
         <div class="nav-links">
             <a href="#" class="nav-link active"><i class="fa-solid fa-grid-2"></i> Dashboard</a>
             <a href="#" class="nav-link"><i class="fa-solid fa-users"></i> Users</a>
             <a href="#" class="nav-link"><i class="fa-solid fa-network-wired"></i> Proxies</a>
             <div style="margin-top: auto; padding-top: 20px; border-top: 1px solid var(--border);">
+                <a href="#" class="nav-link" onclick="updateSystem()"><i class="fa-solid fa-cloud-arrow-down"></i> Update System</a>
                 <a href="#" class="nav-link" onclick="location.reload()"><i class="fa-solid fa-rotate"></i> Refresh</a>
             </div>
         </div>
@@ -313,8 +325,8 @@
                 <div class="stat-value" id="stat-total">0</div>
             </div>
             <div class="stat-card">
-                <div class="stat-label">Active Protocols</div>
-                <div class="stat-value">3</div>
+                <div class="stat-label">Active Users</div>
+                <div class="stat-value" id="stat-active">0</div>
             </div>
             <div class="stat-card">
                 <div class="stat-label">System Status</div>
@@ -336,6 +348,7 @@
                 <thead>
                     <tr>
                         <th>Username</th>
+                        <th>Status</th>
                         <th>Protocol</th>
                         <th>UUID / Password</th>
                         <th>Proxy Route</th>
@@ -402,6 +415,8 @@
 
         // Init
         document.addEventListener('DOMContentLoaded', loadData);
+        // Poll for status every 5 seconds
+        setInterval(loadData, 5000);
 
         function toggleSidebar() {
             document.getElementById('sidebar').classList.toggle('open');
@@ -414,15 +429,36 @@
             document.getElementById('createModal').classList.remove('active');
         }
 
+        async function updateSystem() {
+            if(!confirm("Are you sure you want to update the system from GitHub? The service will restart.")) return;
+            try {
+                showToast("Updating system...", "success");
+                const res = await fetch('/api/update', { method: 'POST' });
+                const data = await res.json();
+                if(data.success) {
+                    showToast(data.message);
+                    setTimeout(() => location.reload(), 3000);
+                } else {
+                    showToast("Update failed: " + data.message, "error");
+                }
+            } catch(e) {
+                showToast("Update error: " + e.message, "error");
+            }
+        }
+
         async function loadData() {
             try {
                 const res = await fetch(API_URL);
-                if (res.status === 401) return; // Auth handled by browser
+                if (res.status === 401) {
+                    window.location.href = '/login.html';
+                    return;
+                }
                 allUsers = await res.json();
                 renderTable(allUsers);
                 document.getElementById('stat-total').innerText = allUsers.length;
+                document.getElementById('stat-active').innerText = allUsers.filter(u => u.status === 'online').length;
             } catch(e) {
-                showToast(e.message, 'error');
+                // Silent error for polling
             }
         }
 
@@ -431,7 +467,7 @@
             tbody.innerHTML = '';
 
             if (users.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="6" style="text-align:center; padding: 30px;">No users found.</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="7" style="text-align:center; padding: 30px;">No users found.</td></tr>';
                 return;
             }
 
@@ -439,9 +475,12 @@
                 const tr = document.createElement('tr');
                 const expiry = new Date(u.expiredDate).toLocaleDateString();
                 const proxyDisplay = u.proxyRoute ? `<span style="font-family:monospace; font-size:0.8rem; background:var(--bg-input); padding:2px 6px; border-radius:4px;">${u.proxyRoute}</span>` : '<span style="color:var(--text-muted)">Direct</span>';
+                const statusClass = u.status === 'online' ? 'status-online' : 'status-offline';
+                const statusText = u.status === 'online' ? 'Online' : 'Offline';
 
                 tr.innerHTML = `
                     <td><b>${u.username}</b></td>
+                    <td><div style="display:flex; align-items:center;"><span class="status-dot ${statusClass}"></span> ${statusText}</div></td>
                     <td><span class="badge badge-${u.protocol}">${u.protocol.toUpperCase()}</span></td>
                     <td style="font-family: monospace; color: var(--text-muted);">${u.uuid.substring(0,8)}...</td>
                     <td>${proxyDisplay}</td>
@@ -491,7 +530,6 @@
             const proxyType = document.getElementById('in_proxy_type').value;
             const days = document.getElementById('in_days').value;
 
-            // Generate UUID
             const uuid = 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
                 const r = Math.random() * 16 | 0, v = c == 'x' ? r : (r & 0x3 | 0x8);
                 return v.toString(16);
@@ -537,7 +575,7 @@
             if (proxyRoute && proxyRoute.trim()) {
                 path = `/${proxyRoute}?proxyType=${proxyType}`;
             } else {
-                path = `/${host}:80`;
+                path = '/';
             }
 
             let link = '';

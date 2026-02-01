@@ -3,8 +3,9 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Nautica Admin Login</title>
+    <title>RUTE PREMIUM | Login</title>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
@@ -18,7 +19,6 @@
             overflow: hidden;
         }
 
-        /* Ambient Background */
         .ambient {
             position: absolute;
             width: 100%;
@@ -46,11 +46,18 @@
 
         .brand {
             text-align: center;
-            margin-bottom: 32px;
+            margin-bottom: 8px;
             font-size: 1.75rem;
             font-weight: 700;
             color: #3b82f6;
             letter-spacing: -0.5px;
+        }
+
+        .subtitle {
+            text-align: center;
+            color: #94a3b8;
+            font-size: 0.9rem;
+            margin-bottom: 32px;
         }
 
         .form-group { margin-bottom: 20px; }
@@ -94,13 +101,43 @@
             font-size: 0.9rem;
             display: none;
         }
+
+        .contact-buttons {
+            display: flex;
+            gap: 12px;
+            margin-top: 24px;
+            padding-top: 24px;
+            border-top: 1px solid #334155;
+        }
+
+        .contact-btn {
+            flex: 1;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+            padding: 10px;
+            border-radius: 8px;
+            text-decoration: none;
+            font-size: 0.9rem;
+            font-weight: 500;
+            transition: opacity 0.2s;
+        }
+        .contact-btn:hover { opacity: 0.8; }
+
+        .btn-wa { background-color: #25D366; color: white; }
+        .btn-tg { background-color: #0088cc; color: white; }
+
     </style>
 </head>
 <body>
     <div class="ambient"></div>
     <div class="login-card">
-        <div class="brand">Nautica Admin</div>
+        <div class="brand">RUTE PREMIUM</div>
+        <div class="subtitle">Secure Tunneling System</div>
+
         <div id="error" class="error-msg">Invalid credentials</div>
+
         <form onsubmit="handleLogin(event)">
             <div class="form-group">
                 <label>Username</label>
@@ -112,6 +149,15 @@
             </div>
             <button type="submit" class="btn">Sign In</button>
         </form>
+
+        <div class="contact-buttons">
+            <a href="https://wa.me/6287733745059" target="_blank" class="contact-btn btn-wa">
+                <i class="fa-brands fa-whatsapp"></i> WhatsApp
+            </a>
+            <a href="https://t.me/otomotif_digital" target="_blank" class="contact-btn btn-tg">
+                <i class="fa-brands fa-telegram"></i> Telegram
+            </a>
+        </div>
     </div>
 
     <script>

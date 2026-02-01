@@ -414,7 +414,7 @@
 
             <div class="table-container">
                 <div class="table-header">
-                    <h3>User List</h3>
+                    <h3>User List <span style="font-size: 0.8rem; color: var(--text-muted); font-weight: 400; margin-left: 8px;">(Total: <span id="stat-total">0</span>)</span></h3>
                     <div class="search-box">
                         <i class="fa-solid fa-search"></i>
                         <input type="text" placeholder="Search user..." id="search" onkeyup="filterUsers()">
@@ -664,8 +664,9 @@
                     <td style="font-family: monospace; color: var(--text-muted);">${u.uuid.substring(0,8)}...</td>
                     <td>${expiry}</td>
                     <td>
-                        <button class="btn btn-primary btn-sm" onclick="copyConfig('${u.uuid}', '${u.protocol}', '${u.username}')"><i class="fa-regular fa-copy"></i></button>
-                        <button class="btn btn-danger btn-sm" onclick="deleteUser('${u.uuid}')"><i class="fa-solid fa-trash"></i></button>
+                        <button class="btn btn-primary btn-sm" onclick="copyConfig('${u.uuid}', '${u.protocol}', '${u.username}')" title="Copy Config"><i class="fa-regular fa-copy"></i></button>
+                        <button class="btn btn-success btn-sm" onclick="copySub('${u.uuid}')" title="Copy Subscription URL"><i class="fa-solid fa-rss"></i></button>
+                        <button class="btn btn-danger btn-sm" onclick="deleteUser('${u.uuid}')" title="Delete User"><i class="fa-solid fa-trash"></i></button>
                     </td>
                 `;
                 tbody.appendChild(tr);
@@ -718,6 +719,11 @@
             } else if (protocol === 'trojan') link = `trojan://${uuid}@${host}:${port}?security=tls&type=ws&host=${host}&path=${encodeURIComponent(path)}#${encodeURIComponent(username)}`;
 
             navigator.clipboard.writeText(link).then(() => showToast('Copied!'));
+        }
+
+        function copySub(uuid) {
+            const url = `${window.location.origin}/sub/${uuid}`;
+            navigator.clipboard.writeText(url).then(() => showToast('Subscription URL Copied!'));
         }
 
         function showToast(msg, type = 'success') {

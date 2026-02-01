@@ -102,8 +102,8 @@ function getDomain() {
     try {
         const caddy = fs.readFileSync('/etc/caddy/Caddyfile', 'utf8');
         const match = caddy.match(/^([a-zA-Z0-9.-]+)\s*\{/);
-        return match ? match[1] : (process.env.DOMAIN_NAME || "Unknown");
-    } catch { return "Unknown"; }
+        return match ? match[1] : (process.env.DOMAIN_NAME || sysInfo.ip || "Unknown");
+    } catch { return sysInfo.ip || "Unknown"; }
 }
 
 function getCpuUsage() {
@@ -138,6 +138,33 @@ function getNetworkTraffic() {
     return { rx: 0, tx: 0 };
 }
 
+// --- Subscription Generator ---
+function generateSubscription(uuid) {
+    const users = getUsers();
+    const user = users.find(u => u.uuid === uuid);
+    if (!user) return "";
+
+    const host = getDomain();
+    const port = 443;
+    const name = encodeURIComponent(user.username);
+
+    let links = [];
+
+    // Generate VLESS
+    links.push(`vless://${uuid}@${host}:${port}?encryption=none&security=tls&type=ws&host=${host}&path=/vless#${name}-VLESS`);
+
+    // Generate VMess
+    const vmess = {
+        v: "2", ps: `${user.username}-VMESS`, add: host, port: port, id: uuid, aid: "0", scy: "auto", net: "ws", type: "none", host: host, path: "/vmess", tls: "tls"
+    };
+    links.push(`vmess://${btoa(JSON.stringify(vmess))}`);
+
+    // Generate Trojan
+    links.push(`trojan://${uuid}@${host}:${port}?security=tls&type=ws&host=${host}&path=/trojan#${name}-TROJAN`);
+
+    return btoa(links.join('\n'));
+}
+
 const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, `http://${req.headers.host}`);
 
@@ -156,6 +183,20 @@ const server = http.createServer(async (req, res) => {
         if (!isAuthenticated) { res.writeHead(401); res.end('Unauthorized'); return; }
     } else if (!isPublic && (url.pathname === '/' || url.pathname.endsWith('.html'))) {
         if (!isAuthenticated) { res.writeHead(302, { 'Location': '/login.html' }); res.end(); return; }
+    }
+
+    // --- Subscription Endpoint ---
+    if (url.pathname.startsWith('/sub/')) {
+        const uuid = url.pathname.split('/').pop();
+        const content = generateSubscription(uuid);
+        if (content) {
+            res.writeHead(200, { 'Content-Type': 'text/plain' });
+            res.end(content);
+        } else {
+            res.writeHead(404);
+            res.end("Subscription not found");
+        }
+        return;
     }
 
     // Login
@@ -253,17 +294,23 @@ const server = http.createServer(async (req, res) => {
         return;
     }
 
-    // Update (FIXED LOGIC)
+    // Update (FIXED DYNAMIC BRANCH)
     if (url.pathname === '/api/update' && req.method === 'POST') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        exec('git fetch --all && git reset --hard origin/main', { cwd: __dirname }, (err, stdout, stderr) => {
-            if (err) {
-                console.error(err);
-                res.end(JSON.stringify({ success: false, message: stderr || err.message }));
-                return;
-            }
-            res.end(JSON.stringify({ success: true, message: "Update successful. Restarting..." }));
-            setTimeout(() => process.exit(0), 3000);
+        // Detect current branch and pull from it
+        exec('git rev-parse --abbrev-ref HEAD', { cwd: __dirname }, (err, stdout) => {
+            const branch = stdout ? stdout.trim() : 'main';
+            console.log(`Updating from branch: ${branch}`);
+
+            exec(`git fetch origin ${branch} && git reset --hard origin/${branch}`, { cwd: __dirname }, (err2, out2, stderr2) => {
+                if (err2) {
+                    console.error(err2);
+                    res.end(JSON.stringify({ success: false, message: stderr2 || err2.message }));
+                    return;
+                }
+                res.end(JSON.stringify({ success: true, message: `Updated from ${branch}. Restarting...` }));
+                setTimeout(() => process.exit(0), 3000);
+            });
         });
         return;
     }

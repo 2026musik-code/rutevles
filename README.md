@@ -2,7 +2,7 @@
 
 Repository: [https://github.com/2026musik-code/rutevles](https://github.com/2026musik-code/rutevles)
 
-This is a comprehensive VLESS/VMess/Trojan tunneling server solution for Ubuntu VPS. It features a modern **Web Admin Panel**, **Real User Authentication**, **Outbound Proxy Routing**, and **Automatic HTTPS** via Caddy.
+This is a comprehensive VLESS/VMess/Trojan tunneling server solution for Ubuntu VPS. It features a modern **Web Admin Panel**, **Real User Authentication**, **Subscription Links**, and **Automatic HTTPS** via Caddy.
 
 ## Key Features
 
@@ -10,17 +10,18 @@ This is a comprehensive VLESS/VMess/Trojan tunneling server solution for Ubuntu 
     *   **VLESS** (UUID v4)
     *   **VMess** (AEAD)
     *   **Trojan**
-    *   **Shadowsocks**
-*   **🚀 Outbound Proxy Routing:**
-    *   Route individual user traffic through upstream SOCKS5 or HTTP proxies.
-    *   Hide your VPS IP address from target websites.
 *   **👥 Real User Management:**
     *   **Web Dashboard:** Create, delete, and manage users easily.
     *   **Authentication:** Server enforces UUID validation against a local database (`users.json`).
     *   **Expiry System:** Auto-reject connections from expired accounts.
+*   **🔗 Subscription System:**
+    *   **RSS Feed:** Generate V2Ray subscription links for easy client configuration.
+    *   **One-Click Copy:** Copy subscription URLs directly from the dashboard.
 *   **🔒 Auto HTTPS:**
     *   Integrated **Caddy Web Server** automatically provisions and renews Let's Encrypt SSL certificates.
     *   Serves the Admin Panel and WebSocket tunnels over standard HTTPS (Port 443).
+*   **📊 Live Stats:**
+    *   Monitor CPU, RAM, Disk, and Network Traffic in real-time.
 
 ## Installation
 
@@ -46,27 +47,18 @@ wget https://raw.githubusercontent.com/2026musik-code/rutevles/main/install.sh &
 Open your browser and navigate to:
 `https://your-domain.com/`
 
-You will see the "MyVPN Vault" dashboard.
+You will see the **RUTE PREMIUM** dashboard. Login with the credentials you set during installation (Default: `admin` / `admin`).
 
 ### 2. Creating an Account
-1.  Click the **(+)** button.
+1.  Click the **(+) New User** button.
 2.  **Username:** Enter a client name.
 3.  **Protocol:** Choose VLESS, VMess, or Trojan.
 4.  **Duration:** Select validity period.
-5.  **Proxy Route (Optional):**
-    *   To route this user's traffic through a proxy, enter `IP:PORT` (e.g., `1.2.3.4:1080`).
-    *   Select the proxy type: `SOCKS5` or `HTTP`.
-6.  Click **"Buat Akun"**.
+5.  Click **"Create"**.
 
 ### 3. Connecting Client
-1.  In the dashboard list, click **"Copy"** on the user card.
-2.  Paste the config link (vless://, vmess://, trojan://) into your client app (v2rayNG, Nekoray, etc.).
-3.  Connect!
-
-### Proxy Routing Explanation
-When you configure a Proxy Route for a user, the generated config link will look like this:
-*   **Path:** `/PROXY_IP:PORT?proxyType=socks5`
-*   **Mechanism:** Your VPS receives the connection -> Handshakes with the Upstream Proxy -> Forwards traffic to the final destination.
+*   **Single Config:** Click the blue **Copy Config** button next to a user.
+*   **Subscription:** Click the green **RSS** button to copy the subscription URL. Paste this into your client app (v2rayNG -> Update Subscription) to import all configs at once.
 
 ## Manual Management
 

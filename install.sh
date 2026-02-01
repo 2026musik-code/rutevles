@@ -179,8 +179,8 @@ function getDomain() {
     try {
         const caddy = fs.readFileSync('/etc/caddy/Caddyfile', 'utf8');
         const match = caddy.match(/^([a-zA-Z0-9.-]+)\s*\{/);
-        return match ? match[1] : (process.env.DOMAIN_NAME || "Unknown");
-    } catch { return "Unknown"; }
+        return match ? match[1] : (process.env.DOMAIN_NAME || sysInfo.ip || "Unknown");
+    } catch { return sysInfo.ip || "Unknown"; }
 }
 
 function getCpuUsage() {
@@ -215,6 +215,33 @@ function getNetworkTraffic() {
     return { rx: 0, tx: 0 };
 }
 
+// --- Subscription Generator ---
+function generateSubscription(uuid) {
+    const users = getUsers();
+    const user = users.find(u => u.uuid === uuid);
+    if (!user) return "";
+
+    const host = getDomain();
+    const port = 443;
+    const name = encodeURIComponent(user.username);
+
+    let links = [];
+
+    // Generate VLESS
+    links.push(`vless://${uuid}@${host}:${port}?encryption=none&security=tls&type=ws&host=${host}&path=/vless#${name}-VLESS`);
+
+    // Generate VMess
+    const vmess = {
+        v: "2", ps: `${user.username}-VMESS`, add: host, port: port, id: uuid, aid: "0", scy: "auto", net: "ws", type: "none", host: host, path: "/vmess", tls: "tls"
+    };
+    links.push(`vmess://${btoa(JSON.stringify(vmess))}`);
+
+    // Generate Trojan
+    links.push(`trojan://${uuid}@${host}:${port}?security=tls&type=ws&host=${host}&path=/trojan#${name}-TROJAN`);
+
+    return btoa(links.join('\n'));
+}
+
 const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, `http://${req.headers.host}`);
 
@@ -233,6 +260,20 @@ const server = http.createServer(async (req, res) => {
         if (!isAuthenticated) { res.writeHead(401); res.end('Unauthorized'); return; }
     } else if (!isPublic && (url.pathname === '/' || url.pathname.endsWith('.html'))) {
         if (!isAuthenticated) { res.writeHead(302, { 'Location': '/login.html' }); res.end(); return; }
+    }
+
+    // --- Subscription Endpoint ---
+    if (url.pathname.startsWith('/sub/')) {
+        const uuid = url.pathname.split('/').pop();
+        const content = generateSubscription(uuid);
+        if (content) {
+            res.writeHead(200, { 'Content-Type': 'text/plain' });
+            res.end(content);
+        } else {
+            res.writeHead(404);
+            res.end("Subscription not found");
+        }
+        return;
     }
 
     // Login
@@ -330,17 +371,23 @@ const server = http.createServer(async (req, res) => {
         return;
     }
 
-    // Update (FIXED LOGIC)
+    // Update (FIXED DYNAMIC BRANCH)
     if (url.pathname === '/api/update' && req.method === 'POST') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        exec('git fetch --all && git reset --hard origin/main', { cwd: __dirname }, (err, stdout, stderr) => {
-            if (err) {
-                console.error(err);
-                res.end(JSON.stringify({ success: false, message: stderr || err.message }));
-                return;
-            }
-            res.end(JSON.stringify({ success: true, message: "Update successful. Restarting..." }));
-            setTimeout(() => process.exit(0), 3000);
+        // Detect current branch and pull from it
+        exec('git rev-parse --abbrev-ref HEAD', { cwd: __dirname }, (err, stdout) => {
+            const branch = stdout ? stdout.trim() : 'main';
+            console.log(`Updating from branch: ${branch}`);
+
+            exec(`git fetch origin ${branch} && git reset --hard origin/${branch}`, { cwd: __dirname }, (err2, out2, stderr2) => {
+                if (err2) {
+                    console.error(err2);
+                    res.end(JSON.stringify({ success: false, message: stderr2 || err2.message }));
+                    return;
+                }
+                res.end(JSON.stringify({ success: true, message: \`Updated from \${branch}. Restarting...\` }));
+                setTimeout(() => process.exit(0), 3000);
+            });
         });
         return;
     }
@@ -996,7 +1043,7 @@ cat <<'EOF' > $INSTALL_DIR/public/index.html
 
             <div class="table-container">
                 <div class="table-header">
-                    <h3>User List</h3>
+                    <h3>User List <span style="font-size: 0.8rem; color: var(--text-muted); font-weight: 400; margin-left: 8px;">(Total: <span id="stat-total">0</span>)</span></h3>
                     <div class="search-box">
                         <i class="fa-solid fa-search"></i>
                         <input type="text" placeholder="Search user..." id="search" onkeyup="filterUsers()">
@@ -1135,7 +1182,7 @@ cat <<'EOF' > $INSTALL_DIR/public/index.html
             document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
             document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
             event.target.classList.add('active');
-            document.getElementById(`tab-${name}`).classList.add('active');
+            document.getElementById(\`tab-\${name}\`).classList.add('active');
         }
 
         // --- System Stats ---
@@ -1152,20 +1199,20 @@ cat <<'EOF' > $INSTALL_DIR/public/index.html
 
                 // Info
                 document.getElementById('stat-ip').innerText = data.info.ip;
-                document.getElementById('stat-isp').innerText = `ISP: ${data.info.isp}`;
+                document.getElementById('stat-isp').innerText = \`ISP: \${data.info.isp}\`;
                 document.getElementById('stat-domain').innerText = data.info.domain;
 
                 // CPU
                 document.getElementById('stat-cpu').innerText = data.cpu.usage + '%';
                 document.getElementById('prog-cpu').style.width = data.cpu.usage + '%';
-                document.getElementById('stat-cores').innerText = `${data.cpu.cores} Cores Detected`;
+                document.getElementById('stat-cores').innerText = \`\${data.cpu.cores} Cores Detected\`;
 
                 // RAM
                 const usedMem = ((data.ram.total - data.ram.free) / 1024 / 1024 / 1024).toFixed(1);
                 const totalMem = (data.ram.total / 1024 / 1024 / 1024).toFixed(1);
                 document.getElementById('stat-ram').innerText = data.ram.usage + '%';
                 document.getElementById('prog-ram').style.width = data.ram.usage + '%';
-                document.getElementById('stat-mem-det').innerText = `${usedMem}GB / ${totalMem}GB`;
+                document.getElementById('stat-mem-det').innerText = \`\${usedMem}GB / \${totalMem}GB\`;
 
                 // Net & Traffic Bar
                 if (window.lastNet) {
@@ -1173,7 +1220,7 @@ cat <<'EOF' > $INSTALL_DIR/public/index.html
                     const diffRx = data.net.rx - window.lastNet.rx;
                     const speedTx = ((diffTx / 2) / 1024).toFixed(1); // KB/s over 2s interval
 
-                    document.getElementById('traffic-text').innerText = `${speedTx} KB/s`;
+                    document.getElementById('traffic-text').innerText = \`\${speedTx} KB/s\`;
 
                     // Visual Horizontal Bar
                     const maxSpeed = 5000; // 5MB/s scale
@@ -1195,8 +1242,8 @@ cat <<'EOF' > $INSTALL_DIR/public/index.html
             if (type === 'reboot') payload.time = document.getElementById('set_reboot').value;
 
             try {
-                showToast(`Updating ${type}...`, 'success');
-                const res = await fetch(`/api/settings/${type}`, {
+                showToast(\`Updating \${type}...\`, 'success');
+                const res = await fetch(\`/api/settings/\${type}\`, {
                     method: 'POST',
                     body: JSON.stringify(payload)
                 });
@@ -1240,16 +1287,17 @@ cat <<'EOF' > $INSTALL_DIR/public/index.html
             users.forEach(u => {
                 const tr = document.createElement('tr');
                 const expiry = new Date(u.expiredDate).toLocaleDateString();
-                tr.innerHTML = `
-                    <td><b>${u.username}</b></td>
-                    <td><span class="badge badge-${u.protocol}">${u.protocol.toUpperCase()}</span></td>
-                    <td style="font-family: monospace; color: var(--text-muted);">${u.uuid.substring(0,8)}...</td>
-                    <td>${expiry}</td>
+                tr.innerHTML = \`
+                    <td><b>\${u.username}</b></td>
+                    <td><span class="badge badge-\${u.protocol}">\${u.protocol.toUpperCase()}</span></td>
+                    <td style="font-family: monospace; color: var(--text-muted);">\${u.uuid.substring(0,8)}...</td>
+                    <td>\${expiry}</td>
                     <td>
-                        <button class="btn btn-primary btn-sm" onclick="copyConfig('${u.uuid}', '${u.protocol}', '${u.username}')"><i class="fa-regular fa-copy"></i></button>
-                        <button class="btn btn-danger btn-sm" onclick="deleteUser('${u.uuid}')"><i class="fa-solid fa-trash"></i></button>
+                        <button class="btn btn-primary btn-sm" onclick="copyConfig('\${u.uuid}', '\${u.protocol}', '\${u.username}')" title="Copy Config"><i class="fa-regular fa-copy"></i></button>
+                        <button class="btn btn-success btn-sm" onclick="copySub('\${u.uuid}')" title="Copy Subscription URL"><i class="fa-solid fa-rss"></i></button>
+                        <button class="btn btn-danger btn-sm" onclick="deleteUser('\${u.uuid}')" title="Delete User"><i class="fa-solid fa-trash"></i></button>
                     </td>
-                `;
+                \`;
                 tbody.appendChild(tr);
             });
         }
@@ -1284,29 +1332,34 @@ cat <<'EOF' > $INSTALL_DIR/public/index.html
 
         async function deleteUser(uuid) {
             if(!confirm('Delete user?')) return;
-            await fetch(`${API_USERS}/${uuid}`, { method: 'DELETE' });
+            await fetch(\`\${API_USERS}/\${uuid}\`, { method: 'DELETE' });
             showToast('User deleted'); loadData();
         }
 
         function copyConfig(uuid, protocol, username) {
             const host = window.location.hostname;
             const port = 443;
-            let path = `/${protocol}`;
+            let path = \`/\${protocol}\`;
             let link = '';
-            if (protocol === 'vless') link = `vless://${uuid}@${host}:${port}?encryption=none&security=tls&type=ws&host=${host}&path=${encodeURIComponent(path)}#${encodeURIComponent(username)}`;
+            if (protocol === 'vless') link = \`vless://\${uuid}@\${host}:\${port}?encryption=none&security=tls&type=ws&host=\${host}&path=\${encodeURIComponent(path)}#\${encodeURIComponent(username)}\`;
             else if (protocol === 'vmess') {
                 const vmessJson = { v: "2", ps: username, add: host, port: port, id: uuid, aid: "0", scy: "auto", net: "ws", type: "none", host: host, path: path, tls: "tls" };
-                link = `vmess://${btoa(JSON.stringify(vmessJson))}`;
-            } else if (protocol === 'trojan') link = `trojan://${uuid}@${host}:${port}?security=tls&type=ws&host=${host}&path=${encodeURIComponent(path)}#${encodeURIComponent(username)}`;
+                link = \`vmess://\${btoa(JSON.stringify(vmessJson))}\`;
+            } else if (protocol === 'trojan') link = \`trojan://\${uuid}@\${host}:\${port}?security=tls&type=ws&host=\${host}&path=\${encodeURIComponent(path)}#\${encodeURIComponent(username)}\`;
 
             navigator.clipboard.writeText(link).then(() => showToast('Copied!'));
+        }
+
+        function copySub(uuid) {
+            const url = \`\${window.location.origin}/sub/\${uuid}\`;
+            navigator.clipboard.writeText(url).then(() => showToast('Subscription URL Copied!'));
         }
 
         function showToast(msg, type = 'success') {
             const div = document.createElement('div');
             div.className = 'toast';
-            div.style.borderLeft = `4px solid ${type === 'success' ? 'var(--success)' : 'var(--danger)'}`;
-            div.innerHTML = `<span>${msg}</span>`;
+            div.style.borderLeft = \`4px solid \${type === 'success' ? 'var(--success)' : 'var(--danger)'}\`;
+            div.innerHTML = \`<span>\${msg}</span>\`;
             document.getElementById('toast-container').appendChild(div);
             setTimeout(() => div.remove(), 3000);
         }

@@ -413,7 +413,7 @@
                     </select>
                 </div>
 
-                <!-- PROXY INPUT ADDED HERE -->
+                <!-- PROXY INPUT -->
                 <div class="form-group">
                     <label>Proxy Route (Optional)</label>
                     <input type="text" id="proxyRoute" placeholder="Contoh: 1.2.3.4:1080">
@@ -439,10 +439,11 @@
     <div id="toast-container"></div>
 
     <script>
-        // API Base URL (Relative)
         const API_URL = '/api/users';
 
-        // Load users on start
+        // --- AUTH: Prompt for credentials or handle 401 ---
+        // For simplicity, browser handles Basic Auth prompt automatically on 401.
+
         window.addEventListener('DOMContentLoaded', loadUsers);
 
         // --- Three.js BG (Simple Particles) ---
@@ -514,11 +515,16 @@
         async function loadUsers() {
             try {
                 const res = await fetch(API_URL);
+                if (res.status === 401) {
+                    // Browser should show prompt, but if not, reload to trigger it
+                    // window.location.reload();
+                    return;
+                }
                 const users = await res.json();
                 renderUserList(users);
                 updateStats(users);
             } catch (err) {
-                showToast("Gagal memuat data", "error");
+                showToast("Gagal memuat data (Auth required)", "error");
             }
         }
 
@@ -605,19 +611,42 @@
 
         function updateStats(users) {
             document.getElementById('total-accounts').innerText = users.length;
-            document.getElementById('total-accounts').nextElementSibling.nextElementSibling.innerText = users.length; // Active same as total for now
+            document.getElementById('total-accounts').nextElementSibling.nextElementSibling.innerText = users.length;
         }
 
         function copyConfig(uuid, protocol, username, proxyRoute, proxyType) {
             const host = window.location.hostname;
-            const port = 443; // Default TLS
+            const port = 443;
             let path = '/';
 
-            // Construct Path with Proxy Logic
-            if (proxyRoute) {
+            // Fix Proxy Path Generation
+            if (proxyRoute && proxyRoute.trim() !== '') {
+                // If proxyRoute includes 'http' or 'socks5', user might have pasted full link?
+                // Assume user enters "IP:PORT"
                 path = `/${proxyRoute}?proxyType=${proxyType}`;
             } else {
-                path = `/${host}:80`; // Default relay fallback or just direct
+                path = `/${host}:80`; // Default relay via standard HTTP
+                // Or maybe just '/' for direct?
+                // The Nautica logic REQUIRES a path like /IP:PORT to know where to connect.
+                // If direct connection to internet is allowed without relay,
+                // we should allow specifying ANY target.
+                // But Nautica usually serves as a relay to specific target encoded in path.
+                // Standard VLESS/VMess connects to a server, then sends traffic to ANYWHERE.
+                // However, the worker implementation reads `prxIP` from path.
+                // If we want standard VPN behavior (connect to any site), `prxIP` logic is only for *outbound proxy*.
+                // Wait, if `prxIP` is missing, `server.js` tries to connect to `addressRemote` directly?
+                // Let's check `handleTCPOutBound` in server.js.
+                // `if (prxIP && proxyType)` -> Connects to proxy.
+                // `else if (prxIP && !proxyType)` -> Connects to prxIP (Relay).
+                // `else` -> Connects to `addressRemote` (Direct).
+
+                // SO: To allow normal VPN usage (browsing google.com etc), we should NOT set a `prxIP` in the path unless we want to route via a proxy.
+                // But the websocket handler EXTRACTS `prxIP` from path `/(.+[:=-]\d+)`.
+                // If we set path `/`, `prxIP` is empty.
+                // Then `handleTCPOutBound` falls to `else` -> Direct connect to `addressRemote`.
+                // This is correct for standard VPN usage!
+
+                path = '/';
             }
 
             let link = '';
@@ -627,6 +656,7 @@
                 const vmessJson = {
                     v: "2", ps: username, add: host, port: port, id: uuid, aid: "0", scy: "auto", net: "ws", type: "none", host: host, path: path, tls: "tls"
                 };
+                // Use built-in btoa for base64
                 link = `vmess://${btoa(JSON.stringify(vmessJson))}`;
             } else if (protocol === 'trojan') {
                 link = `trojan://${uuid}@${host}:${port}?security=tls&type=ws&host=${host}&path=${encodeURIComponent(path)}#${encodeURIComponent(username)}`;
@@ -634,6 +664,10 @@
 
             navigator.clipboard.writeText(link).then(() => {
                 showToast(`Config ${username} disalin`);
+            }, (err) => {
+                // Fallback if clipboard fails (non-secure context)
+                console.error(err);
+                prompt("Copy config link:", link);
             });
         }
     </script>

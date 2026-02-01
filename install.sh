@@ -1559,10 +1559,13 @@ cat <<'EOF' > $INSTALL_DIR/public/index.html
             const port = 443; // Default TLS
             let path = '/';
 
-            if (proxyRoute) {
+            // Fix Proxy Path Generation
+            if (proxyRoute && proxyRoute.trim() !== '') {
+                // If proxyRoute includes 'http' or 'socks5', user might have pasted full link?
+                // Assume user enters "IP:PORT"
                 path = `/${proxyRoute}?proxyType=${proxyType}`;
             } else {
-                path = `/${host}:80`;
+                path = '/';
             }
 
             let link = '';
@@ -1572,6 +1575,7 @@ cat <<'EOF' > $INSTALL_DIR/public/index.html
                 const vmessJson = {
                     v: "2", ps: username, add: host, port: port, id: uuid, aid: "0", scy: "auto", net: "ws", type: "none", host: host, path: path, tls: "tls"
                 };
+                // Use built-in btoa for base64
                 link = `vmess://${btoa(JSON.stringify(vmessJson))}`;
             } else if (protocol === 'trojan') {
                 link = `trojan://${uuid}@${host}:${port}?security=tls&type=ws&host=${host}&path=${encodeURIComponent(path)}#${encodeURIComponent(username)}`;
@@ -1579,6 +1583,10 @@ cat <<'EOF' > $INSTALL_DIR/public/index.html
 
             navigator.clipboard.writeText(link).then(() => {
                 showToast(`Config ${username} disalin`);
+            }, (err) => {
+                // Fallback if clipboard fails (non-secure context)
+                console.error(err);
+                prompt("Copy config link:", link);
             });
         }
     </script>
@@ -1600,18 +1608,6 @@ npm install
 
 # 3. Configure Caddy
 echo "[3/4] Configuring Caddy..."
-cat <<EOF > /etc/caddy/Caddyfile
-$DOMAIN_NAME {
-    reverse_proxy localhost:3000
-    basicauth / {
-        admin $(caddy hash-password --plaintext $ADMIN_PASS)
-    }
-}
-EOF
-# Note: Basic auth in Caddy is an alternative layer of security,
-# but since we implemented it in Node.js, we can skip it here or use it as double protection.
-# Let's rely on Node.js auth for simplicity in Caddyfile (to avoid Caddy hash requirement if caddy utils not present)
-# RE-WRITE Caddyfile simple:
 cat <<EOF > /etc/caddy/Caddyfile
 $DOMAIN_NAME {
     reverse_proxy localhost:3000

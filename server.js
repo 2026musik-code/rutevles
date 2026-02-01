@@ -10,7 +10,6 @@ const crypto = webcrypto;
 const DB_FILE = path.join(__dirname, 'users.json');
 const CONFIG_FILE = path.join(__dirname, 'config.json');
 const SESSIONS = new Map();
-const ACTIVE_CONNS = new Map(); // uuid -> count
 
 const horse = "dHJvamFu";
 const flash = "dm1lc3M=";
@@ -45,24 +44,17 @@ function arrayBufferToHex(buf) { return Buffer.from(buf).toString('hex'); }
 
 function getUsers() {
     if (!fs.existsSync(DB_FILE)) return [];
-    try {
-        const users = JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
-        // Inject active status
-        return users.map(u => ({
-            ...u,
-            status: (ACTIVE_CONNS.get(u.uuid) || 0) > 0 ? 'online' : 'offline'
-        }));
-    } catch { return []; }
+    try { return JSON.parse(fs.readFileSync(DB_FILE, 'utf8')); } catch { return []; }
 }
 
 function saveUser(user) {
-    const users = getUsers().map(u => { delete u.status; return u; }); // remove status before save
+    const users = getUsers();
     users.unshift(user);
     fs.writeFileSync(DB_FILE, JSON.stringify(users, null, 2));
 }
 
 function deleteUser(uuid) {
-    const users = getUsers().filter(u => u.uuid !== uuid).map(u => { delete u.status; return u; });
+    const users = getUsers().filter(u => u.uuid !== uuid);
     fs.writeFileSync(DB_FILE, JSON.stringify(users, null, 2));
 }
 
@@ -73,6 +65,14 @@ function isValidUser(uuid) {
     const expDate = new Date(user.expiredDate);
     if (new Date() > expDate) return false;
     return true;
+}
+
+function isValidTrojanUser(hash) {
+    const users = getUsers().filter(u => u.protocol === 'trojan');
+    for (const u of users) {
+        if (createHash('sha224').update(u.uuid).digest('hex') === hash) return true;
+    }
+    return false;
 }
 
 function getAdminCredentials() {
@@ -126,18 +126,14 @@ const server = http.createServer(async (req, res) => {
         }
 
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        // Execute git pull and restart
         exec('git pull origin main', { cwd: __dirname }, (err, stdout, stderr) => {
             if (err) {
                 console.error(err);
                 res.end(JSON.stringify({ success: false, message: stderr }));
                 return;
             }
-            console.log(stdout);
             res.end(JSON.stringify({ success: true, message: "Update successful. Restarting..." }));
-            setTimeout(() => {
-                process.exit(0); // Systemd will restart it
-            }, 1000);
+            setTimeout(() => process.exit(0), 1000);
         });
         return;
     }
@@ -254,7 +250,6 @@ server.on('upgrade', async (request, socket, head) => {
 async function websocketHandler(webSocket, request, prxIP, proxyType) {
     const wsStream = WebSocket.createWebSocketStream(webSocket);
     const log = (msg) => console.log(`[WS] ${msg}`);
-    let userUuid = null;
 
     wsStream.once('data', async (chunk) => {
         wsStream.pause();
@@ -271,10 +266,6 @@ async function websocketHandler(webSocket, request, prxIP, proxyType) {
                 protocolHeader = readHorseHeader(chunk);
                 if (!protocolHeader.hasError && isValidTrojanUser(protocolHeader.passwordHash)) {
                     authenticated = true;
-                    // Find uuid for status tracking
-                    const users = getUsers().map(u => { delete u.status; return u; });
-                    const u = users.find(u => u.protocol === 'trojan' && createHash('sha224').update(u.uuid).digest('hex') === protocolHeader.passwordHash);
-                    if (u) userUuid = u.uuid;
                 }
             } else if (protocol === atob(neko)) { // VLESS
                 protocolHeader = readNekoHeader(chunk);
@@ -283,24 +274,22 @@ async function websocketHandler(webSocket, request, prxIP, proxyType) {
                 log(`VLESS UUID: ${formattedUUID}`);
                 if (isValidUser(formattedUUID)) {
                     authenticated = true;
-                    userUuid = formattedUUID;
                 } else {
                     log(`User not found in DB: ${formattedUUID}`);
                 }
             } else if (protocol === atob(flash)) { // VMess
-                const users = getUsers().map(u => { delete u.status; return u; });
-                const vmessUsers = users.filter(u => u.protocol === 'vmess');
-                for (const user of vmessUsers) {
+                const users = getUsers().filter(u => u.protocol === 'vmess');
+                for (const user of users) {
                     const result = await readStreamHeader(chunk, user.uuid);
                     if (!result.hasError) {
                         protocolHeader = result;
                         authenticated = true;
-                        userUuid = user.uuid;
                         log(`VMess Auth Success: ${user.uuid}`);
                         break;
                     }
                 }
             } else {
+                log("Unknown Protocol Data: " + chunk.toString('hex').substring(0, 50));
                 throw new Error("Unknown Protocol");
             }
 
@@ -314,12 +303,6 @@ async function websocketHandler(webSocket, request, prxIP, proxyType) {
                 return;
             }
 
-            // Track Connection
-            if (userUuid) {
-                const current = ACTIVE_CONNS.get(userUuid) || 0;
-                ACTIVE_CONNS.set(userUuid, current + 1);
-            }
-
             let responseHeader = protocolHeader.version;
             if (protocol === atob(flash) && protocolHeader.needsResponse) {
                  responseHeader = await generateStreamResponseHeader(
@@ -328,6 +311,8 @@ async function websocketHandler(webSocket, request, prxIP, proxyType) {
                     protocolHeader.encIv,
                 );
             }
+
+            log(`Connecting to Target: ${protocolHeader.addressRemote}:${protocolHeader.portRemote} (UDP: ${protocolHeader.isUDP})`);
 
             if (protocolHeader.isUDP) {
                 await handleUDPOutbound(
@@ -363,27 +348,20 @@ async function websocketHandler(webSocket, request, prxIP, proxyType) {
     });
 
     wsStream.on('error', (err) => log(`Stream Error: ${err.message}`));
-    wsStream.on('close', () => {
-        if (userUuid) {
-            const current = ACTIVE_CONNS.get(userUuid) || 0;
-            if (current > 0) ACTIVE_CONNS.set(userUuid, current - 1);
-        }
-    });
 }
-
-// ... (Rest of Proxy/Protocol logic retained from the "Good" version - NOT the strict Nautica one) ...
-// Restoring the "Native Node" logic which was working for Proxying:
 
 async function handleTCPOutBound(addressRemote, portRemote, rawClientData, webSocket, responseHeader, log, prxIP, proxyType, wsStream) {
     async function connectTarget(addr, port) {
         if (proxyType) {
             if (!prxIP) throw new Error("ProxyType set but no ProxyIP provided");
+
             let sepIdx = -1;
             if (prxIP.includes('=')) sepIdx = prxIP.lastIndexOf('=');
             else if (prxIP.includes('-')) sepIdx = prxIP.lastIndexOf('-');
             else sepIdx = prxIP.lastIndexOf(':');
 
             if (sepIdx === -1) throw new Error("Invalid Proxy IP format");
+
             const pAddr = prxIP.substring(0, sepIdx);
             const pPort = parseInt(prxIP.substring(sepIdx + 1));
 
@@ -414,18 +392,32 @@ async function handleTCPOutBound(addressRemote, portRemote, rawClientData, webSo
     try {
         const { socket: tcpSocket, leftover } = await connectTarget(addressRemote, portRemote);
 
-        if (responseHeader && responseHeader.length > 0) wsStream.write(Buffer.from(responseHeader));
-        if (leftover && leftover.length > 0) wsStream.write(leftover);
-        if (rawClientData && rawClientData.length > 0) tcpSocket.write(rawClientData);
+        if (responseHeader && responseHeader.length > 0) {
+            wsStream.write(Buffer.from(responseHeader));
+        }
+
+        if (leftover && leftover.length > 0) {
+            wsStream.write(leftover);
+        }
+
+        if (rawClientData && rawClientData.length > 0) {
+            tcpSocket.write(rawClientData);
+        }
 
         wsStream.resume();
         wsStream.pipe(tcpSocket);
         tcpSocket.pipe(wsStream);
 
         tcpSocket.on('error', (e) => log(`TCP Error: ${e.message}`));
-        tcpSocket.on('close', () => { log("TCP Closed"); webSocket.close(); });
+        tcpSocket.on('close', () => {
+            log("TCP Closed");
+            webSocket.close();
+        });
 
-    } catch (e) { log(`Outbound Failed: ${e.message}`); webSocket.close(); }
+    } catch (e) {
+        log(`Outbound Connection Failed: ${e.message}`);
+        webSocket.close();
+    }
 }
 
 async function socks5Connect(socket, targetAddress, targetPort) {
@@ -461,6 +453,7 @@ async function socks5Connect(socket, targetAddress, targetPort) {
 
                 let leftover = null;
                 if (data2.length > headerLen) leftover = data2.slice(headerLen);
+
                 resolve({ socket, leftover });
             });
         });
@@ -522,7 +515,6 @@ async function handleUDPOutbound(targetAddress, targetPort, dataChunk, webSocket
     } catch(e) { webSocket.close(); }
 }
 
-// --- Protocol Parsers (Native Node Logic) ---
 async function protocolSniffer(buffer) {
     if (buffer.length >= 18 && buffer[0] === 0) return atob(neko);
     if (buffer.length >= 62) {
@@ -642,5 +634,7 @@ async function kdf(key, path) {
     }
     return result;
 }
+
+function arrayBufferToHex(buf) { return Buffer.from(buf).toString('hex'); }
 
 server.listen(PORT, () => { console.log(`Server running on ${PORT}`); });

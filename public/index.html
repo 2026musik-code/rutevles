@@ -212,15 +212,6 @@
         .badge-vmess { background: rgba(245, 158, 11, 0.1); color: var(--warning); }
         .badge-trojan { background: rgba(59, 130, 246, 0.1); color: var(--primary); }
 
-        .status-dot {
-            display: inline-block;
-            width: 8px; height: 8px;
-            border-radius: 50%;
-            margin-right: 6px;
-        }
-        .status-online { background-color: var(--success); box-shadow: 0 0 8px var(--success); }
-        .status-offline { background-color: var(--text-muted); }
-
         /* Modal */
         .modal-overlay {
             position: fixed;
@@ -325,8 +316,8 @@
                 <div class="stat-value" id="stat-total">0</div>
             </div>
             <div class="stat-card">
-                <div class="stat-label">Active Users</div>
-                <div class="stat-value" id="stat-active">0</div>
+                <div class="stat-label">Active Protocols</div>
+                <div class="stat-value">3</div>
             </div>
             <div class="stat-card">
                 <div class="stat-label">System Status</div>
@@ -348,7 +339,6 @@
                 <thead>
                     <tr>
                         <th>Username</th>
-                        <th>Status</th>
                         <th>Protocol</th>
                         <th>UUID / Password</th>
                         <th>Proxy Route</th>
@@ -415,8 +405,6 @@
 
         // Init
         document.addEventListener('DOMContentLoaded', loadData);
-        // Poll for status every 5 seconds
-        setInterval(loadData, 5000);
 
         function toggleSidebar() {
             document.getElementById('sidebar').classList.toggle('open');
@@ -456,9 +444,8 @@
                 allUsers = await res.json();
                 renderTable(allUsers);
                 document.getElementById('stat-total').innerText = allUsers.length;
-                document.getElementById('stat-active').innerText = allUsers.filter(u => u.status === 'online').length;
             } catch(e) {
-                // Silent error for polling
+                showToast(e.message, 'error');
             }
         }
 
@@ -467,7 +454,7 @@
             tbody.innerHTML = '';
 
             if (users.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="7" style="text-align:center; padding: 30px;">No users found.</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="6" style="text-align:center; padding: 30px;">No users found.</td></tr>';
                 return;
             }
 
@@ -475,12 +462,9 @@
                 const tr = document.createElement('tr');
                 const expiry = new Date(u.expiredDate).toLocaleDateString();
                 const proxyDisplay = u.proxyRoute ? `<span style="font-family:monospace; font-size:0.8rem; background:var(--bg-input); padding:2px 6px; border-radius:4px;">${u.proxyRoute}</span>` : '<span style="color:var(--text-muted)">Direct</span>';
-                const statusClass = u.status === 'online' ? 'status-online' : 'status-offline';
-                const statusText = u.status === 'online' ? 'Online' : 'Offline';
 
                 tr.innerHTML = `
                     <td><b>${u.username}</b></td>
-                    <td><div style="display:flex; align-items:center;"><span class="status-dot ${statusClass}"></span> ${statusText}</div></td>
                     <td><span class="badge badge-${u.protocol}">${u.protocol.toUpperCase()}</span></td>
                     <td style="font-family: monospace; color: var(--text-muted);">${u.uuid.substring(0,8)}...</td>
                     <td>${proxyDisplay}</td>

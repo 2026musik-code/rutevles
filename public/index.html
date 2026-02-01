@@ -73,6 +73,7 @@
             border-radius: 8px;
             margin-bottom: 4px;
             transition: all 0.2s;
+            cursor: pointer;
         }
 
         .nav-link:hover, .nav-link.active {
@@ -139,8 +140,43 @@
             padding: 24px;
         }
 
-        .stat-label { color: var(--text-muted); font-size: 0.9rem; margin-bottom: 8px; }
-        .stat-value { font-size: 2rem; font-weight: 700; color: white; }
+        .stat-label { color: var(--text-muted); font-size: 0.9rem; margin-bottom: 8px; display: flex; justify-content: space-between; }
+        .stat-value { font-size: 1.5rem; font-weight: 700; color: white; }
+        .stat-sub { font-size: 0.8rem; color: var(--text-muted); margin-top: 4px; }
+
+        /* Progress Bar */
+        .progress-bg {
+            background-color: var(--bg-input);
+            height: 6px;
+            border-radius: 3px;
+            margin-top: 12px;
+            overflow: hidden;
+        }
+        .progress-fill {
+            height: 100%;
+            background-color: var(--primary);
+            width: 0%;
+            transition: width 0.5s ease;
+        }
+
+        /* Traffic Bar */
+        .traffic-card {
+            background-color: var(--bg-panel);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 24px;
+            margin-bottom: 32px;
+        }
+        .traffic-header { display: flex; justify-content: space-between; margin-bottom: 16px; }
+        .traffic-bars { display: flex; height: 40px; gap: 4px; align-items: flex-end; }
+        .t-bar {
+            flex: 1;
+            background-color: rgba(59, 130, 246, 0.2);
+            border-radius: 2px;
+            transition: height 0.2s;
+            min-height: 4px;
+        }
+        .t-bar.active { background-color: var(--primary); }
 
         /* Table */
         .table-container {
@@ -248,6 +284,13 @@
         }
         .form-group input:focus, .form-group select:focus { border-color: var(--primary); }
 
+        /* Tabs */
+        .tabs { display: flex; gap: 10px; margin-bottom: 20px; border-bottom: 1px solid var(--border); }
+        .tab { padding: 10px; color: var(--text-muted); cursor: pointer; border-bottom: 2px solid transparent; }
+        .tab.active { color: var(--primary); border-bottom-color: var(--primary); }
+        .tab-content { display: none; }
+        .tab-content.active { display: block; }
+
         /* Mobile */
         .mobile-toggle { display: none; color: white; font-size: 1.5rem; cursor: pointer; }
 
@@ -257,7 +300,7 @@
             .main { margin-left: 0; padding: 20px; }
             .mobile-toggle { display: block; margin-right: 16px; }
             .table-container { overflow-x: auto; }
-            .header-actions { display: none; } /* Hide profile on mobile to save space */
+            .header-actions { display: none; }
         }
 
         /* Toast */
@@ -284,9 +327,8 @@
             <i class="fa-solid fa-bolt"></i> RUTE PREMIUM
         </div>
         <div class="nav-links">
-            <a href="#" class="nav-link active"><i class="fa-solid fa-grid-2"></i> Dashboard</a>
-            <a href="#" class="nav-link"><i class="fa-solid fa-users"></i> Users</a>
-            <!-- Removed Proxies Link as requested -->
+            <a onclick="showSection('dashboard')" class="nav-link active"><i class="fa-solid fa-grid-2"></i> Dashboard</a>
+            <a onclick="showSection('settings')" class="nav-link"><i class="fa-solid fa-gear"></i> Settings</a>
             <div style="margin-top: auto; padding-top: 20px; border-top: 1px solid var(--border);">
                 <a href="#" class="nav-link" onclick="updateSystem()"><i class="fa-solid fa-cloud-arrow-down"></i> Update System</a>
                 <a href="#" class="nav-link" onclick="location.reload()"><i class="fa-solid fa-rotate"></i> Refresh</a>
@@ -294,61 +336,134 @@
         </div>
     </nav>
 
-    <main class="main">
-        <div class="header">
-            <div style="display:flex; align-items:center;">
-                <div class="mobile-toggle" onclick="toggleSidebar()"><i class="fa-solid fa-bars"></i></div>
-                <div class="title">
-                    <h1>Dashboard</h1>
-                    <p>Manage your VLESS/VMess/Trojan Accounts</p>
+    <main class="main" id="main-content">
+        <!-- Dashboard Section -->
+        <div id="section-dashboard">
+            <div class="header">
+                <div style="display:flex; align-items:center;">
+                    <div class="mobile-toggle" onclick="toggleSidebar()"><i class="fa-solid fa-bars"></i></div>
+                    <div class="title">
+                        <h1>Dashboard</h1>
+                        <p>System Overview & User Management</p>
+                    </div>
+                </div>
+                <div class="header-actions">
+                    <button class="btn btn-primary" onclick="openModal('createModal')">
+                        <i class="fa-solid fa-plus"></i> New User
+                    </button>
                 </div>
             </div>
-            <div class="header-actions">
-                <button class="btn btn-primary" onclick="openModal()">
-                    <i class="fa-solid fa-plus"></i> New User
-                </button>
+
+            <div class="stats-grid">
+                <div class="stat-card">
+                    <div class="stat-label">Public IP <i class="fa-solid fa-globe"></i></div>
+                    <div class="stat-value" id="stat-ip" style="font-size: 1.2rem;">Loading...</div>
+                    <div class="stat-sub">VPS Address</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">CPU Load <i class="fa-solid fa-microchip"></i></div>
+                    <div class="stat-value" id="stat-cpu">0%</div>
+                    <div class="progress-bg"><div class="progress-fill" id="prog-cpu" style="width: 0%"></div></div>
+                    <div class="stat-sub" id="stat-cores">Loading Cores...</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">RAM Usage <i class="fa-solid fa-memory"></i></div>
+                    <div class="stat-value" id="stat-ram">0%</div>
+                    <div class="progress-bg"><div class="progress-fill" id="prog-ram" style="width: 0%; background-color: var(--warning);"></div></div>
+                    <div class="stat-sub" id="stat-mem-det">Loading...</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Network I/O <i class="fa-solid fa-network-wired"></i></div>
+                    <div class="stat-value" id="stat-net" style="font-size: 1.2rem;">0 KB/s</div>
+                    <div class="stat-sub">Total RX/TX</div>
+                </div>
+            </div>
+
+            <div class="traffic-card">
+                <div class="traffic-header">
+                    <h3>Live Traffic</h3>
+                    <span style="color: var(--text-muted); font-size: 0.9rem;">Real-time Network Load (Mbps)</span>
+                </div>
+                <div class="traffic-bars" id="traffic-bars">
+                    <!-- 30 bars generated via JS -->
+                </div>
+            </div>
+
+            <div class="table-container">
+                <div class="table-header">
+                    <h3>User List</h3>
+                    <div class="search-box">
+                        <i class="fa-solid fa-search"></i>
+                        <input type="text" placeholder="Search user..." id="search" onkeyup="filterUsers()">
+                    </div>
+                </div>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Username</th>
+                            <th>Protocol</th>
+                            <th>UUID / Password</th>
+                            <th>Expiry</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody id="user-table-body">
+                    </tbody>
+                </table>
             </div>
         </div>
 
-        <div class="stats-grid">
-            <div class="stat-card">
-                <div class="stat-label">Total Users</div>
-                <div class="stat-value" id="stat-total">0</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-label">Active Protocols</div>
-                <div class="stat-value">3</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-label">System Status</div>
-                <div class="stat-value" style="color: var(--success); font-size: 1.5rem;">
-                    <i class="fa-solid fa-circle-check"></i> Online
+        <!-- Settings Section -->
+        <div id="section-settings" style="display: none;">
+            <div class="header">
+                <div style="display:flex; align-items:center;">
+                    <div class="mobile-toggle" onclick="toggleSidebar()"><i class="fa-solid fa-bars"></i></div>
+                    <div class="title">
+                        <h1>Settings</h1>
+                        <p>Server Configuration</p>
+                    </div>
                 </div>
             </div>
-        </div>
 
-        <div class="table-container">
-            <div class="table-header">
-                <h3>User List</h3>
-                <div class="search-box">
-                    <i class="fa-solid fa-search"></i>
-                    <input type="text" placeholder="Search user..." id="search" onkeyup="filterUsers()">
+            <div class="modal" style="width: 100%; max-width: 600px; box-shadow: none;">
+                <div class="tabs">
+                    <div class="tab active" onclick="switchTab('domain')">Domain</div>
+                    <div class="tab" onclick="switchTab('password')">Password</div>
+                    <div class="tab" onclick="switchTab('reboot')">Auto Reboot</div>
+                </div>
+
+                <div id="tab-domain" class="tab-content active">
+                    <form onsubmit="handleSettings('domain', event)">
+                        <div class="form-group">
+                            <label>Server Domain</label>
+                            <input type="text" id="set_domain" placeholder="vpn.example.com" required>
+                            <small style="color: var(--text-muted)">Changes will update Caddyfile and restart the web server.</small>
+                        </div>
+                        <button type="submit" class="btn btn-primary">Save Domain</button>
+                    </form>
+                </div>
+
+                <div id="tab-password" class="tab-content">
+                    <form onsubmit="handleSettings('password', event)">
+                        <div class="form-group">
+                            <label>New Admin Password</label>
+                            <input type="password" id="set_password" required>
+                        </div>
+                        <button type="submit" class="btn btn-primary">Update Password</button>
+                    </form>
+                </div>
+
+                <div id="tab-reboot" class="tab-content">
+                    <form onsubmit="handleSettings('reboot', event)">
+                        <div class="form-group">
+                            <label>Reboot Time (Server Time)</label>
+                            <input type="time" id="set_reboot" required>
+                            <small style="color: var(--text-muted)">Schedules a daily cron job to reboot the VPS.</small>
+                        </div>
+                        <button type="submit" class="btn btn-danger">Set Reboot Schedule</button>
+                    </form>
                 </div>
             </div>
-            <table>
-                <thead>
-                    <tr>
-                        <th>Username</th>
-                        <th>Protocol</th>
-                        <th>UUID / Password</th>
-                        <th>Expiry</th>
-                        <th>Actions</th>
-                    </tr>
-                </thead>
-                <tbody id="user-table-body">
-                    <!-- Data Injected Here -->
-                </tbody>
-            </table>
         </div>
     </main>
 
@@ -369,7 +484,6 @@
                         <option value="trojan">TROJAN</option>
                     </select>
                 </div>
-                <!-- Proxy Route Inputs Removed -->
                 <div class="form-group">
                     <label>Duration</label>
                     <select id="in_days">
@@ -379,7 +493,7 @@
                     </select>
                 </div>
                 <div style="display: flex; justify-content: flex-end; gap: 12px;">
-                    <button type="button" class="btn" style="background: var(--bg-input); color: white;" onclick="closeModal()">Cancel</button>
+                    <button type="button" class="btn" style="background: var(--bg-input); color: white;" onclick="closeModal('createModal')">Cancel</button>
                     <button type="submit" class="btn btn-primary">Create</button>
                 </div>
             </form>
@@ -389,81 +503,166 @@
     <div id="toast-container"></div>
 
     <script>
-        const API_URL = '/api/users';
+        const API_USERS = '/api/users';
+        const API_STATS = '/api/stats';
         let allUsers = [];
+        let statsInterval;
 
         // Init
-        document.addEventListener('DOMContentLoaded', loadData);
+        document.addEventListener('DOMContentLoaded', () => {
+            loadData();
+            initTrafficBar();
+            startStatsLoop();
+        });
 
-        function toggleSidebar() {
-            document.getElementById('sidebar').classList.toggle('open');
+        function toggleSidebar() { document.getElementById('sidebar').classList.toggle('open'); }
+        function openModal(id) { document.getElementById(id).classList.add('active'); }
+        function closeModal(id) { document.getElementById(id).classList.remove('active'); }
+
+        function showSection(name) {
+            document.querySelectorAll('.nav-link').forEach(l => l.classList.remove('active'));
+            event.currentTarget.classList.add('active'); // assuming click
+
+            document.getElementById('section-dashboard').style.display = name === 'dashboard' ? 'block' : 'none';
+            document.getElementById('section-settings').style.display = name === 'settings' ? 'block' : 'none';
         }
 
-        function openModal() {
-            document.getElementById('createModal').classList.add('active');
-        }
-        function closeModal() {
-            document.getElementById('createModal').classList.remove('active');
+        function switchTab(name) {
+            document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+            document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+            event.target.classList.add('active');
+            document.getElementById(`tab-${name}`).classList.add('active');
         }
 
-        async function updateSystem() {
-            if(!confirm("Are you sure you want to update the system from GitHub? The service will restart.")) return;
+        // --- System Stats ---
+        function startStatsLoop() {
+            fetchStats();
+            statsInterval = setInterval(fetchStats, 2000);
+        }
+
+        async function fetchStats() {
             try {
-                showToast("Updating system...", "success");
-                const res = await fetch('/api/update', { method: 'POST' });
+                const res = await fetch(API_STATS);
+                if (!res.ok) return;
                 const data = await res.json();
-                if(data.success) {
-                    showToast(data.message);
-                    setTimeout(() => location.reload(), 3000);
-                } else {
-                    showToast("Update failed: " + data.message, "error");
+
+                // IP
+                document.getElementById('stat-ip').innerText = data.ip;
+
+                // CPU
+                document.getElementById('stat-cpu').innerText = data.cpu.usage + '%';
+                document.getElementById('prog-cpu').style.width = data.cpu.usage + '%';
+                document.getElementById('stat-cores').innerText = `${data.cpu.cores} Cores Detected`;
+
+                // RAM
+                const usedMem = ((data.ram.total - data.ram.free) / 1024 / 1024 / 1024).toFixed(1);
+                const totalMem = (data.ram.total / 1024 / 1024 / 1024).toFixed(1);
+                document.getElementById('stat-ram').innerText = data.ram.usage + '%';
+                document.getElementById('prog-ram').style.width = data.ram.usage + '%';
+                document.getElementById('stat-mem-det').innerText = `${usedMem}GB / ${totalMem}GB`;
+
+                // Net
+                const txMbps = (data.net.tx / 1024 / 1024 * 8).toFixed(1); // approx since last boot, but we want rate?
+                // Note: /api/stats returns cumulative. We need to diff in JS to get rate.
+                // For simplicity, let's just show cumulative for now or implement rate logic in JS.
+                // Rate Logic:
+                if (window.lastNet) {
+                    const diffTx = data.net.tx - window.lastNet.tx;
+                    const speed = ((diffTx / 2) / 1024).toFixed(1); // KB/s over 2s
+                    document.getElementById('stat-net').innerText = `${speed} KB/s`;
+                    updateTrafficBar(speed); // Visualize
                 }
-            } catch(e) {
-                showToast("Update error: " + e.message, "error");
+                window.lastNet = data.net;
+
+            } catch(e) { console.error(e); }
+        }
+
+        function initTrafficBar() {
+            const container = document.getElementById('traffic-bars');
+            for(let i=0; i<30; i++) {
+                const bar = document.createElement('div');
+                bar.className = 't-bar';
+                container.appendChild(bar);
             }
+        }
+
+        function updateTrafficBar(kbs) {
+            const bars = document.querySelectorAll('.t-bar');
+            // Shift height logic simulates a scrolling chart
+            // Simple: just update a random bar? No, slide.
+            // Actually, let's just make the rightmost bar represent current load
+            // and shift values left.
+            // Simplified: Just randomize visual for "activity" based on load level
+            const load = Math.min(100, kbs / 10); // scale 1000KB/s = 100% height
+
+            // Shift heights
+            for(let i=0; i<bars.length-1; i++) {
+                bars[i].style.height = bars[i+1].style.height;
+                if (parseInt(bars[i].style.height) > 20) bars[i].classList.add('active');
+                else bars[i].classList.remove('active');
+            }
+            const last = bars[bars.length-1];
+            last.style.height = Math.max(4, load) + '%';
+        }
+
+        // --- Settings Actions ---
+        async function handleSettings(type, e) {
+            e.preventDefault();
+            const payload = {};
+
+            if (type === 'domain') payload.domain = document.getElementById('set_domain').value;
+            if (type === 'password') payload.password = document.getElementById('set_password').value;
+            if (type === 'reboot') payload.time = document.getElementById('set_reboot').value;
+
+            try {
+                showToast(`Updating ${type}...`, 'success');
+                const res = await fetch(`/api/settings/${type}`, {
+                    method: 'POST',
+                    body: JSON.stringify(payload)
+                });
+                const data = await res.json();
+                if (data.success) showToast('Settings saved successfully!');
+                else showToast('Error: ' + data.error, 'error');
+            } catch(e) { showToast('Connection Error', 'error'); }
+        }
+
+        // --- Existing User Logic ---
+        async function updateSystem() {
+            if(!confirm("Update system from GitHub?")) return;
+            try {
+                showToast("Updating...", "success");
+                await fetch('/api/update', { method: 'POST' });
+                showToast("Done. Reloading...");
+                setTimeout(() => location.reload(), 3000);
+            } catch(e) { showToast("Error", "error"); }
         }
 
         async function loadData() {
             try {
-                const res = await fetch(API_URL);
-                if (res.status === 401) {
-                    window.location.href = '/login.html';
-                    return;
-                }
+                const res = await fetch(API_USERS);
+                if (res.status === 401) { window.location.href = '/login.html'; return; }
                 allUsers = await res.json();
                 renderTable(allUsers);
                 document.getElementById('stat-total').innerText = allUsers.length;
-            } catch(e) {
-                showToast(e.message, 'error');
-            }
+            } catch(e) { showToast(e.message, 'error'); }
         }
 
         function renderTable(users) {
             const tbody = document.getElementById('user-table-body');
             tbody.innerHTML = '';
-
-            if (users.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="6" style="text-align:center; padding: 30px;">No users found.</td></tr>';
-                return;
-            }
+            if (users.length === 0) { tbody.innerHTML = '<tr><td colspan="5" style="text-align:center; padding: 30px;">No users found.</td></tr>'; return; }
 
             users.forEach(u => {
                 const tr = document.createElement('tr');
                 const expiry = new Date(u.expiredDate).toLocaleDateString();
-                // Removed Proxy Display Column
-
                 tr.innerHTML = `
                     <td><b>${u.username}</b></td>
                     <td><span class="badge badge-${u.protocol}">${u.protocol.toUpperCase()}</span></td>
                     <td style="font-family: monospace; color: var(--text-muted);">${u.uuid.substring(0,8)}...</td>
                     <td>${expiry}</td>
                     <td>
-                        <button class="btn btn-primary btn-sm" onclick="copyConfig('${u.uuid}', '${u.protocol}', '${u.username}')">
-                            <i class="fa-regular fa-copy"></i>
-                        </button>
-                        <button class="btn btn-danger btn-sm" onclick="deleteUser('${u.uuid}')">
-                            <i class="fa-solid fa-trash"></i>
-                        </button>
+                        <button class="btn btn-primary btn-sm" onclick="copyConfig('${u.uuid}', '${u.protocol}', '${u.username}')"><i class="fa-regular fa-copy"></i></button>
+                        <button class="btn btn-danger btn-sm" onclick="deleteUser('${u.uuid}')"><i class="fa-solid fa-trash"></i></button>
                     </td>
                 `;
                 tbody.appendChild(tr);
@@ -478,10 +677,8 @@
 
         async function createUser(e) {
             e.preventDefault();
-
             const username = document.getElementById('in_username').value;
             const protocol = document.getElementById('in_protocol').value;
-            // Proxy inputs removed
             const days = document.getElementById('in_days').value;
 
             const uuid = 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
@@ -491,57 +688,33 @@
 
             const date = new Date();
             date.setDate(date.getDate() + parseInt(days));
-
             const payload = { username, protocol, uuid, days, expiredDate: date.toISOString() };
 
             try {
-                const res = await fetch(API_URL, {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify(payload)
-                });
-                if (res.ok) {
-                    showToast('User created successfully');
-                    closeModal();
-                    loadData();
-                    e.target.reset();
-                } else {
-                    showToast('Failed to create user', 'error');
-                }
+                const res = await fetch(API_USERS, { method: 'POST', body: JSON.stringify(payload) });
+                if (res.ok) { showToast('User created'); closeModal('createModal'); loadData(); e.target.reset(); }
+                else showToast('Failed', 'error');
             } catch(e) { showToast(e.message, 'error'); }
         }
 
         async function deleteUser(uuid) {
-            if(!confirm('Are you sure you want to delete this user?')) return;
-            try {
-                const res = await fetch(`${API_URL}/${uuid}`, { method: 'DELETE' });
-                if (res.ok) {
-                    showToast('User deleted');
-                    loadData();
-                }
-            } catch(e) { showToast(e.message, 'error'); }
+            if(!confirm('Delete user?')) return;
+            await fetch(`${API_USERS}/${uuid}`, { method: 'DELETE' });
+            showToast('User deleted'); loadData();
         }
 
         function copyConfig(uuid, protocol, username) {
             const host = window.location.hostname;
             const port = 443;
-
-            // Dynamic Path Logic (Simple now)
-            let path = `/${protocol}`; // Default: /vless, /vmess, /trojan
-
+            let path = `/${protocol}`;
             let link = '';
-            if (protocol === 'vless') {
-                link = `vless://${uuid}@${host}:${port}?encryption=none&security=tls&type=ws&host=${host}&path=${encodeURIComponent(path)}#${encodeURIComponent(username)}`;
-            } else if (protocol === 'vmess') {
-                const vmessJson = {
-                    v: "2", ps: username, add: host, port: port, id: uuid, aid: "0", scy: "auto", net: "ws", type: "none", host: host, path: path, tls: "tls"
-                };
+            if (protocol === 'vless') link = `vless://${uuid}@${host}:${port}?encryption=none&security=tls&type=ws&host=${host}&path=${encodeURIComponent(path)}#${encodeURIComponent(username)}`;
+            else if (protocol === 'vmess') {
+                const vmessJson = { v: "2", ps: username, add: host, port: port, id: uuid, aid: "0", scy: "auto", net: "ws", type: "none", host: host, path: path, tls: "tls" };
                 link = `vmess://${btoa(JSON.stringify(vmessJson))}`;
-            } else if (protocol === 'trojan') {
-                link = `trojan://${uuid}@${host}:${port}?security=tls&type=ws&host=${host}&path=${encodeURIComponent(path)}#${encodeURIComponent(username)}`;
-            }
+            } else if (protocol === 'trojan') link = `trojan://${uuid}@${host}:${port}?security=tls&type=ws&host=${host}&path=${encodeURIComponent(path)}#${encodeURIComponent(username)}`;
 
-            navigator.clipboard.writeText(link).then(() => showToast('Config copied to clipboard'));
+            navigator.clipboard.writeText(link).then(() => showToast('Copied!'));
         }
 
         function showToast(msg, type = 'success') {

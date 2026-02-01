@@ -3,6 +3,7 @@ const net = require('net');
 const WebSocket = require('ws');
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 const { webcrypto, createHash, randomUUID } = require('crypto');
 const { exec } = require('child_process');
 const crypto = webcrypto;
@@ -15,8 +16,6 @@ const horse = "dHJvamFu";
 const flash = "dm1lc3M=";
 const neko = "dmxlc3M=";
 
-// Relay removed as we are going direct
-const PRX_HEALTH_CHECK_API = "https://id1.foolvpn.web.id/api/v1/check";
 const CORS_HEADER_OPTIONS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET,HEAD,POST,DELETE,OPTIONS",
@@ -24,6 +23,7 @@ const CORS_HEADER_OPTIONS = {
   "Access-Control-Allow-Headers": "Content-Type, Authorization"
 };
 
+// ... Crypto Constants ...
 const SALT_A1 = atob("Vk1lc3MgSGVhZGVyIEFFQUQgS2V5X0xlbmd0aA==");
 const SALT_A2 = atob("Vk1lc3MgSGVhZGVyIEFFQUQgTm9uY2VfTGVuZ3Ro");
 const SALT_A3 = atob("Vk1lc3MgSGVhZGVyIEFFQUQgS2V5");
@@ -35,6 +35,7 @@ const SALT_B4 = atob("QUVBRCBSZXNwIEhlYWRlciBJVg==");
 
 const PORT = process.env.PORT || 80;
 
+// --- Helpers ---
 function atob(str) { return Buffer.from(str, 'base64').toString('binary'); }
 function btoa(str) { return Buffer.from(str, 'binary').toString('base64'); }
 function arrayBufferToHex(buf) { return Buffer.from(buf).toString('hex'); }
@@ -77,10 +78,89 @@ function getAdminCredentials() {
     try { return JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')); } catch { return { adminUser: 'admin', adminPass: 'admin' }; }
 }
 
+// --- System Stats Helper ---
+let previousCpuUsage = null;
+let publicIP = "Loading...";
+
+// Fetch Public IP once on start
+exec('curl -s https://api.ipify.org', (err, stdout) => {
+    if (!err) publicIP = stdout.trim();
+});
+
+function getCpuUsage() {
+    const cpus = os.cpus();
+    let user = 0, nice = 0, sys = 0, idle = 0, irq = 0;
+
+    for (const cpu of cpus) {
+        user += cpu.times.user;
+        nice += cpu.times.nice;
+        sys += cpu.times.sys;
+        idle += cpu.times.idle;
+        irq += cpu.times.irq;
+    }
+
+    const total = user + nice + sys + idle + irq;
+    const usage = { total, idle };
+
+    let percent = 0;
+    if (previousCpuUsage) {
+        const totalDiff = total - previousCpuUsage.total;
+        const idleDiff = idle - previousCpuUsage.idle;
+        if (totalDiff > 0) {
+            percent = 100 - Math.round((idleDiff / totalDiff) * 100);
+        }
+    }
+    previousCpuUsage = usage;
+    return percent;
+}
+
+function getNetworkTraffic() {
+    // Read /proc/net/dev for eth0 (or first non-lo interface)
+    try {
+        const data = fs.readFileSync('/proc/net/dev', 'utf8');
+        const lines = data.split('\n');
+        for (const line of lines) {
+            if (line.includes(':') && !line.trim().startsWith('lo')) {
+                const parts = line.split(':')[1].trim().split(/\s+/);
+                return { rx: parseInt(parts[0]), tx: parseInt(parts[8]) };
+            }
+        }
+    } catch { }
+    return { rx: 0, tx: 0 };
+}
+
 const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, `http://${req.headers.host}`);
 
-    // API: Login
+    // AUTH CHECK (Middleware style)
+    const isPublic = url.pathname.startsWith("/sub") || url.pathname === '/login.html' || url.pathname === '/api/login';
+    let isAuthenticated = false;
+
+    const cookieHeader = req.headers.cookie;
+    if (cookieHeader) {
+        const cookies = cookieHeader.split(';').reduce((acc, c) => {
+            const [n, v] = c.trim().split('='); acc[n] = v; return acc;
+        }, {});
+        if (cookies.session_token && SESSIONS.has(cookies.session_token)) isAuthenticated = true;
+    }
+
+    if (url.pathname.startsWith('/api/') && url.pathname !== '/api/login') {
+        if (!isAuthenticated) {
+            res.writeHead(401);
+            res.end('Unauthorized');
+            return;
+        }
+    } else if (!isPublic && (url.pathname === '/' || url.pathname.endsWith('.html'))) {
+        if (!isAuthenticated) {
+            res.writeHead(302, { 'Location': '/login.html' });
+            res.end();
+            return;
+        }
+    }
+
+    // --- API ROUTES ---
+
+    // Login
     if (url.pathname === '/api/login' && req.method === 'POST') {
         let body = '';
         req.on('data', chunk => body += chunk);
@@ -105,23 +185,94 @@ const server = http.createServer(async (req, res) => {
         return;
     }
 
-    // API: Update System
+    // System Stats
+    if (url.pathname === '/api/stats' && req.method === 'GET') {
+        const stats = {
+            ip: publicIP,
+            ram: {
+                total: os.totalmem(),
+                free: os.freemem(),
+                usage: Math.round(((os.totalmem() - os.freemem()) / os.totalmem()) * 100)
+            },
+            cpu: {
+                cores: os.cpus().length,
+                usage: getCpuUsage()
+            },
+            net: getNetworkTraffic()
+        };
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(stats));
+        return;
+    }
+
+    // Settings: Domain
+    if (url.pathname === '/api/settings/domain' && req.method === 'POST') {
+        let body = '';
+        req.on('data', chunk => body += chunk);
+        req.on('end', () => {
+            try {
+                const { domain } = JSON.parse(body);
+                if (!domain || !/^[a-zA-Z0-9.-]+$/.test(domain)) throw new Error("Invalid Domain");
+
+                const caddyFile = `${domain} {\n    reverse_proxy localhost:${PORT}\n}`;
+                fs.writeFileSync('/etc/caddy/Caddyfile', caddyFile);
+                exec('systemctl reload caddy', (err) => {
+                    if (err) {
+                        res.writeHead(500); res.end(JSON.stringify({ error: "Failed to reload Caddy" }));
+                    } else {
+                        res.writeHead(200); res.end(JSON.stringify({ success: true }));
+                    }
+                });
+            } catch (e) { res.writeHead(400); res.end(JSON.stringify({ error: e.message })); }
+        });
+        return;
+    }
+
+    // Settings: Password
+    if (url.pathname === '/api/settings/password' && req.method === 'POST') {
+        let body = '';
+        req.on('data', chunk => body += chunk);
+        req.on('end', () => {
+            try {
+                const { password } = JSON.parse(body);
+                if (!password) throw new Error("Missing password");
+
+                const creds = getAdminCredentials();
+                creds.adminPass = password;
+                fs.writeFileSync(CONFIG_FILE, JSON.stringify(creds, null, 2));
+                res.writeHead(200); res.end(JSON.stringify({ success: true }));
+            } catch (e) { res.writeHead(400); res.end(JSON.stringify({ error: e.message })); }
+        });
+        return;
+    }
+
+    // Settings: Reboot
+    if (url.pathname === '/api/settings/reboot' && req.method === 'POST') {
+        let body = '';
+        req.on('data', chunk => body += chunk);
+        req.on('end', () => {
+            try {
+                const { time } = JSON.parse(body); // "00:00" format
+                if (!time || !/^\d{2}:\d{2}$/.test(time)) throw new Error("Invalid time format");
+
+                const [h, m] = time.split(':');
+                // Remove existing reboot jobs and add new one
+                exec('crontab -l | grep -v "sbin/reboot"', (err, stdout) => {
+                    const newCron = `${stdout.trim()}\n${m} ${h} * * * /sbin/reboot\n`;
+                    const p = exec('crontab -', (e) => {
+                        if (e) { res.writeHead(500); res.end(JSON.stringify({ error: "Failed to update crontab" })); }
+                        else { res.writeHead(200); res.end(JSON.stringify({ success: true })); }
+                    });
+                    p.stdin.write(newCron);
+                    p.stdin.end();
+                });
+            } catch (e) { res.writeHead(400); res.end(JSON.stringify({ error: e.message })); }
+        });
+        return;
+    }
+
+    // Update System
     if (url.pathname === '/api/update' && req.method === 'POST') {
-        const cookieHeader = req.headers.cookie;
-        let isAuthenticated = false;
-        if (cookieHeader) {
-            const cookies = cookieHeader.split(';').reduce((acc, c) => {
-                const [n, v] = c.trim().split('='); acc[n] = v; return acc;
-            }, {});
-            if (cookies.session_token && SESSIONS.has(cookies.session_token)) isAuthenticated = true;
-        }
-
-        if(!isAuthenticated) {
-            res.writeHead(401);
-            res.end("Unauthorized");
-            return;
-        }
-
         res.writeHead(200, { 'Content-Type': 'application/json' });
         exec('git pull origin main', { cwd: __dirname }, (err, stdout, stderr) => {
             if (err) {
@@ -134,38 +285,7 @@ const server = http.createServer(async (req, res) => {
         return;
     }
 
-    if (req.method === 'OPTIONS') {
-        res.writeHead(200, CORS_HEADER_OPTIONS);
-        res.end();
-        return;
-    }
-
-    const isPublic = url.pathname.startsWith("/check") || url.pathname.startsWith("/sub") || url.pathname === '/login.html';
-
-    // Auth Check
-    let isAuthenticated = false;
-    const cookieHeader = req.headers.cookie;
-    if (cookieHeader) {
-        const cookies = cookieHeader.split(';').reduce((acc, c) => {
-            const [n, v] = c.trim().split('='); acc[n] = v; return acc;
-        }, {});
-        if (cookies.session_token && SESSIONS.has(cookies.session_token)) isAuthenticated = true;
-    }
-
-    if (!isPublic && (url.pathname.startsWith('/api/') || url.pathname === '/' || url.pathname.endsWith('.html'))) {
-        if (!isAuthenticated) {
-            if (url.pathname === '/' || url.pathname.endsWith('.html')) {
-                res.writeHead(302, { 'Location': '/login.html' });
-                res.end();
-            } else {
-                res.writeHead(401);
-                res.end('Unauthorized');
-            }
-            return;
-        }
-    }
-
-    // API: Users
+    // Users API
     if (url.pathname === '/api/users') {
         if (req.method === 'GET') {
             res.writeHead(200, { ...CORS_HEADER_OPTIONS, 'Content-Type': 'application/json' });
@@ -198,6 +318,7 @@ const server = http.createServer(async (req, res) => {
         return;
     }
 
+    // Static Files
     let requestedPath = url.pathname === '/' ? '/index.html' : url.pathname;
     requestedPath = requestedPath.split('?')[0];
     const publicDir = path.join(__dirname, 'public');
@@ -209,17 +330,6 @@ const server = http.createServer(async (req, res) => {
          res.writeHead(200, { 'Content-Type': mime });
          fs.createReadStream(safePath).pipe(res);
          return;
-    }
-
-    if (url.pathname.startsWith("/check")) {
-        const target = url.searchParams.get("target").split(":");
-        try {
-            const cres = await fetch(`${PRX_HEALTH_CHECK_API}?ip=${target[0]}:${target[1]||443}`);
-            const json = await cres.json();
-            res.writeHead(200, { ...CORS_HEADER_OPTIONS, "Content-Type": "application/json" });
-            res.end(JSON.stringify(json));
-        } catch(e) { res.writeHead(500); res.end("{}"); }
-        return;
     }
 
     res.writeHead(404);
@@ -365,40 +475,11 @@ async function handleTCPOutbound(addressRemote, portRemote, rawClientData, webSo
 }
 
 async function handleUDPOutbound(targetAddress, targetPort, dataChunk, webSocket, wsStream, log) {
-    // For UDP, simply create a socket and write.
-    // In strict VLESS/Trojan UDP, we just pipe the datagrams if supported by the backend logic.
-    // Since we removed the relay, we act as a direct UDP forwarder if possible,
-    // BUT standard Node `net` doesn't handle UDP. We need `dgram`.
-    // However, VLESS over TCP/WS usually encapsulates UDP packets.
-    // If the target is a UDP service, we should use dgram.
-    // But usually for "Tunneling", we just treat it as a stream or use a UDP socket.
-
-    // NOTE: The previous code was using a specific Relay Server format `udp:ip:port|data`.
-    // Since the user said "Remove Proxy Route System", and the Relay was part of that "Proxy/Tunneling" logic
-    // (specifically to tunnel UDP over TCP/Proxy), we might need to fallback to standard behavior.
-    // Standard behavior for VLESS over WS is that the stream *contains* UDP packets if the command was UDP.
-    // But Node.js cannot "pipe" a WebSocket stream to a UDP socket directly because UDP is message-based.
-
-    // If we simply drop the Relay, we must implement a local UDP socket handler that reads from the stream,
-    // parses the length (if VLESS), sends to target, receives, wraps, and sends back.
-    // That is complex.
-    // Alternatively, since the user asked to remove "System Route Proxy", they might just want *TCP* functionality
-    // or they assume the "Good Setting" handles it.
-
-    // For now, I will use a simple UDP socket implementation that attempts to forward.
-    // But without packet length parsing, stream-to-UDP is impossible.
-    // Given the constraints and the removal of the Relay, I will implement a basic "Error: UDP not supported in direct mode without relay"
-    // OR keep the relay *only* for UDP if strictly necessary?
-    // "System rute proxy hapus aja" -> Delete the proxy route system.
-
-    // I will log that UDP is not fully supported in this simplified direct mode without the specific relay logic,
-    // or attempting to implement a basic one is risky without parsing libraries.
-    // I'll leave a placeholder or close connection for UDP to avoid "hanging".
-
     log("UDP requested but Proxy/Relay system is removed. Closing.");
     webSocket.close();
 }
 
+// ... Protocol Logic (Sniffer/Reader) ...
 async function protocolSniffer(buffer) {
     if (buffer.length >= 18 && buffer[0] === 0) return atob(neko);
     if (buffer.length >= 62) {

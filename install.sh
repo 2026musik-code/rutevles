@@ -31,7 +31,7 @@ fi
 # 1. Install Dependencies
 echo "[1/4] Installing dependencies..."
 apt-get update
-apt-get install -y curl debian-keyring debian-archive-keyring apt-transport-https unzip git
+apt-get install -y curl debian-keyring debian-archive-keyring apt-transport-https unzip git cron
 
 curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
 apt-get install -y nodejs
@@ -72,6 +72,7 @@ const net = require('net');
 const WebSocket = require('ws');
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 const { webcrypto, createHash, randomUUID } = require('crypto');
 const { exec } = require('child_process');
 const crypto = webcrypto;
@@ -84,8 +85,6 @@ const horse = "dHJvamFu";
 const flash = "dm1lc3M=";
 const neko = "dmxlc3M=";
 
-// Relay removed as we are going direct
-const PRX_HEALTH_CHECK_API = "https://id1.foolvpn.web.id/api/v1/check";
 const CORS_HEADER_OPTIONS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET,HEAD,POST,DELETE,OPTIONS",
@@ -146,10 +145,64 @@ function getAdminCredentials() {
     try { return JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')); } catch { return { adminUser: 'admin', adminPass: 'admin' }; }
 }
 
+// Stats
+let previousCpuUsage = null;
+let publicIP = "Loading...";
+exec('curl -s https://api.ipify.org', (err, stdout) => { if (!err) publicIP = stdout.trim(); });
+
+function getCpuUsage() {
+    const cpus = os.cpus();
+    let user = 0, nice = 0, sys = 0, idle = 0, irq = 0;
+    for (const cpu of cpus) {
+        user += cpu.times.user; nice += cpu.times.nice; sys += cpu.times.sys; idle += cpu.times.idle; irq += cpu.times.irq;
+    }
+    const total = user + nice + sys + idle + irq;
+    const usage = { total, idle };
+    let percent = 0;
+    if (previousCpuUsage) {
+        const totalDiff = total - previousCpuUsage.total;
+        const idleDiff = idle - previousCpuUsage.idle;
+        if (totalDiff > 0) percent = 100 - Math.round((idleDiff / totalDiff) * 100);
+    }
+    previousCpuUsage = usage;
+    return percent;
+}
+
+function getNetworkTraffic() {
+    try {
+        const data = fs.readFileSync('/proc/net/dev', 'utf8');
+        const lines = data.split('\n');
+        for (const line of lines) {
+            if (line.includes(':') && !line.trim().startsWith('lo')) {
+                const parts = line.split(':')[1].trim().split(/\s+/);
+                return { rx: parseInt(parts[0]), tx: parseInt(parts[8]) };
+            }
+        }
+    } catch { }
+    return { rx: 0, tx: 0 };
+}
+
 const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, `http://${req.headers.host}`);
 
-    // API: Login
+    // Auth Check
+    const isPublic = url.pathname.startsWith("/sub") || url.pathname === '/login.html' || url.pathname === '/api/login';
+    let isAuthenticated = false;
+    const cookieHeader = req.headers.cookie;
+    if (cookieHeader) {
+        const cookies = cookieHeader.split(';').reduce((acc, c) => {
+            const [n, v] = c.trim().split('='); acc[n] = v; return acc;
+        }, {});
+        if (cookies.session_token && SESSIONS.has(cookies.session_token)) isAuthenticated = true;
+    }
+
+    if (url.pathname.startsWith('/api/') && url.pathname !== '/api/login') {
+        if (!isAuthenticated) { res.writeHead(401); res.end('Unauthorized'); return; }
+    } else if (!isPublic && (url.pathname === '/' || url.pathname.endsWith('.html'))) {
+        if (!isAuthenticated) { res.writeHead(302, { 'Location': '/login.html' }); res.end(); return; }
+    }
+
+    // Login
     if (url.pathname === '/api/login' && req.method === 'POST') {
         let body = '';
         req.on('data', chunk => body += chunk);
@@ -160,10 +213,7 @@ const server = http.createServer(async (req, res) => {
                 if (username === creds.adminUser && password === creds.adminPass) {
                     const token = randomUUID();
                     SESSIONS.set(token, { user: username, created: Date.now() });
-                    res.writeHead(200, {
-                        'Set-Cookie': `session_token=${token}; HttpOnly; Path=/; Max-Age=86400`,
-                        'Content-Type': 'application/json'
-                    });
+                    res.writeHead(200, { 'Set-Cookie': `session_token=${token}; HttpOnly; Path=/; Max-Age=86400`, 'Content-Type': 'application/json' });
                     res.end(JSON.stringify({ success: true }));
                 } else {
                     res.writeHead(401, { 'Content-Type': 'application/json' });
@@ -174,67 +224,88 @@ const server = http.createServer(async (req, res) => {
         return;
     }
 
-    // API: Update System
+    // API Stats
+    if (url.pathname === '/api/stats' && req.method === 'GET') {
+        const stats = {
+            ip: publicIP,
+            ram: { total: os.totalmem(), free: os.freemem(), usage: Math.round(((os.totalmem() - os.freemem()) / os.totalmem()) * 100) },
+            cpu: { cores: os.cpus().length, usage: getCpuUsage() },
+            net: getNetworkTraffic()
+        };
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(stats));
+        return;
+    }
+
+    // Settings
+    if (url.pathname === '/api/settings/domain' && req.method === 'POST') {
+        let body = '';
+        req.on('data', chunk => body += chunk);
+        req.on('end', () => {
+            try {
+                const { domain } = JSON.parse(body);
+                if (!domain || !/^[a-zA-Z0-9.-]+$/.test(domain)) throw new Error("Invalid Domain");
+                const caddyFile = `${domain} {\n    reverse_proxy localhost:${PORT}\n}`;
+                fs.writeFileSync('/etc/caddy/Caddyfile', caddyFile);
+                exec('systemctl reload caddy', (err) => {
+                    if (err) { res.writeHead(500); res.end(JSON.stringify({ error: "Failed to reload Caddy" })); }
+                    else { res.writeHead(200); res.end(JSON.stringify({ success: true })); }
+                });
+            } catch (e) { res.writeHead(400); res.end(JSON.stringify({ error: e.message })); }
+        });
+        return;
+    }
+
+    if (url.pathname === '/api/settings/password' && req.method === 'POST') {
+        let body = '';
+        req.on('data', chunk => body += chunk);
+        req.on('end', () => {
+            try {
+                const { password } = JSON.parse(body);
+                if (!password) throw new Error("Missing password");
+                const creds = getAdminCredentials();
+                creds.adminPass = password;
+                fs.writeFileSync(CONFIG_FILE, JSON.stringify(creds, null, 2));
+                res.writeHead(200); res.end(JSON.stringify({ success: true }));
+            } catch (e) { res.writeHead(400); res.end(JSON.stringify({ error: e.message })); }
+        });
+        return;
+    }
+
+    if (url.pathname === '/api/settings/reboot' && req.method === 'POST') {
+        let body = '';
+        req.on('data', chunk => body += chunk);
+        req.on('end', () => {
+            try {
+                const { time } = JSON.parse(body);
+                if (!time || !/^\d{2}:\d{2}$/.test(time)) throw new Error("Invalid time");
+                const [h, m] = time.split(':');
+                exec('crontab -l | grep -v "sbin/reboot"', (err, stdout) => {
+                    const newCron = `${stdout ? stdout.trim() + '\n' : ''}${m} ${h} * * * /sbin/reboot\n`;
+                    const p = exec('crontab -', (e) => {
+                        if (e) { res.writeHead(500); res.end(JSON.stringify({ error: "Failed to update crontab" })); }
+                        else { res.writeHead(200); res.end(JSON.stringify({ success: true })); }
+                    });
+                    p.stdin.write(newCron);
+                    p.stdin.end();
+                });
+            } catch (e) { res.writeHead(400); res.end(JSON.stringify({ error: e.message })); }
+        });
+        return;
+    }
+
+    // Update
     if (url.pathname === '/api/update' && req.method === 'POST') {
-        const cookieHeader = req.headers.cookie;
-        let isAuthenticated = false;
-        if (cookieHeader) {
-            const cookies = cookieHeader.split(';').reduce((acc, c) => {
-                const [n, v] = c.trim().split('='); acc[n] = v; return acc;
-            }, {});
-            if (cookies.session_token && SESSIONS.has(cookies.session_token)) isAuthenticated = true;
-        }
-
-        if(!isAuthenticated) {
-            res.writeHead(401);
-            res.end("Unauthorized");
-            return;
-        }
-
         res.writeHead(200, { 'Content-Type': 'application/json' });
         exec('git pull origin main', { cwd: __dirname }, (err, stdout, stderr) => {
-            if (err) {
-                res.end(JSON.stringify({ success: false, message: stderr }));
-                return;
-            }
+            if (err) { res.end(JSON.stringify({ success: false, message: stderr })); return; }
             res.end(JSON.stringify({ success: true, message: "Update successful. Restarting..." }));
             setTimeout(() => process.exit(0), 1000);
         });
         return;
     }
 
-    if (req.method === 'OPTIONS') {
-        res.writeHead(200, CORS_HEADER_OPTIONS);
-        res.end();
-        return;
-    }
-
-    const isPublic = url.pathname.startsWith("/check") || url.pathname.startsWith("/sub") || url.pathname === '/login.html';
-
-    // Auth Check
-    let isAuthenticated = false;
-    const cookieHeader = req.headers.cookie;
-    if (cookieHeader) {
-        const cookies = cookieHeader.split(';').reduce((acc, c) => {
-            const [n, v] = c.trim().split('='); acc[n] = v; return acc;
-        }, {});
-        if (cookies.session_token && SESSIONS.has(cookies.session_token)) isAuthenticated = true;
-    }
-
-    if (!isPublic && (url.pathname.startsWith('/api/') || url.pathname === '/' || url.pathname.endsWith('.html'))) {
-        if (!isAuthenticated) {
-            if (url.pathname === '/' || url.pathname.endsWith('.html')) {
-                res.writeHead(302, { 'Location': '/login.html' });
-                res.end();
-            } else {
-                res.writeHead(401);
-                res.end('Unauthorized');
-            }
-            return;
-        }
-    }
-
-    // API: Users
+    // Users
     if (url.pathname === '/api/users') {
         if (req.method === 'GET') {
             res.writeHead(200, { ...CORS_HEADER_OPTIONS, 'Content-Type': 'application/json' });
@@ -250,10 +321,7 @@ const server = http.createServer(async (req, res) => {
                     saveUser(data);
                     res.writeHead(200, CORS_HEADER_OPTIONS);
                     res.end(JSON.stringify({ success: true }));
-                } catch (e) {
-                    res.writeHead(400, CORS_HEADER_OPTIONS);
-                    res.end(JSON.stringify({ error: e.message }));
-                }
+                } catch (e) { res.writeHead(400, CORS_HEADER_OPTIONS); res.end(JSON.stringify({ error: e.message })); }
             });
             return;
         }
@@ -267,6 +335,7 @@ const server = http.createServer(async (req, res) => {
         return;
     }
 
+    // Static
     let requestedPath = url.pathname === '/' ? '/index.html' : url.pathname;
     requestedPath = requestedPath.split('?')[0];
     const publicDir = path.join(__dirname, 'public');
@@ -278,17 +347,6 @@ const server = http.createServer(async (req, res) => {
          res.writeHead(200, { 'Content-Type': mime });
          fs.createReadStream(safePath).pipe(res);
          return;
-    }
-
-    if (url.pathname.startsWith("/check")) {
-        const target = url.searchParams.get("target").split(":");
-        try {
-            const cres = await fetch(`${PRX_HEALTH_CHECK_API}?ip=${target[0]}:${target[1]||443}`);
-            const json = await cres.json();
-            res.writeHead(200, { ...CORS_HEADER_OPTIONS, "Content-Type": "application/json" });
-            res.end(JSON.stringify(json));
-        } catch(e) { res.writeHead(500); res.end("{}"); }
-        return;
     }
 
     res.writeHead(404);
@@ -309,181 +367,82 @@ async function websocketHandler(webSocket, request) {
 
     wsStream.once('data', async (chunk) => {
         wsStream.pause();
-
         try {
             const protocol = await protocolSniffer(chunk);
             let protocolHeader;
             let authenticated = false;
 
-            log(`Sniffed Protocol: ${protocol}`);
-
-            if (protocol === atob(horse)) { // Trojan
+            if (protocol === atob(horse)) {
                 protocolHeader = readHorseHeader(chunk);
-                if (!protocolHeader.hasError && isValidTrojanUser(protocolHeader.passwordHash)) {
-                    authenticated = true;
-                }
-            } else if (protocol === atob(neko)) { // VLESS
+                if (!protocolHeader.hasError && isValidTrojanUser(protocolHeader.passwordHash)) authenticated = true;
+            } else if (protocol === atob(neko)) {
                 protocolHeader = readNekoHeader(chunk);
                 const uuid = arrayBufferToHex(chunk.slice(1, 17));
                 const formattedUUID = `${uuid.substr(0,8)}-${uuid.substr(8,4)}-${uuid.substr(12,4)}-${uuid.substr(16,4)}-${uuid.substr(20,12)}`;
-                log(`VLESS UUID: ${formattedUUID}`);
-                if (isValidUser(formattedUUID)) {
-                    authenticated = true;
-                } else {
-                    log(`User not found in DB: ${formattedUUID}`);
-                }
-            } else if (protocol === atob(flash)) { // VMess
+                if (isValidUser(formattedUUID)) authenticated = true;
+            } else if (protocol === atob(flash)) {
                 const users = getUsers().filter(u => u.protocol === 'vmess');
                 for (const user of users) {
                     const result = await readStreamHeader(chunk, user.uuid);
-                    if (!result.hasError) {
-                        protocolHeader = result;
-                        authenticated = true;
-                        log(`VMess Auth Success: ${user.uuid}`);
-                        break;
-                    }
+                    if (!result.hasError) { protocolHeader = result; authenticated = true; break; }
                 }
-            } else {
-                throw new Error("Unknown Protocol");
-            }
+            } else throw new Error("Unknown Protocol");
 
-            if (!protocolHeader || protocolHeader.hasError) {
-                throw new Error(protocolHeader ? protocolHeader.message : "Header Parse Failed");
-            }
+            if (!protocolHeader || protocolHeader.hasError) throw new Error("Header Parse Failed");
+            if (!authenticated) { webSocket.close(); return; }
 
-            if (!authenticated) {
-                log("Authentication Failed");
-                webSocket.close();
-                return;
-            }
-
-            // 1. Send Response Header
             let responseHeader = protocolHeader.version;
             if (protocol === atob(flash) && protocolHeader.needsResponse) {
-                 responseHeader = await generateStreamResponseHeader(
-                    protocolHeader.responseOptions,
-                    protocolHeader.encKey,
-                    protocolHeader.encIv,
-                );
+                 responseHeader = await generateStreamResponseHeader(protocolHeader.responseOptions, protocolHeader.encKey, protocolHeader.encIv);
             }
 
-            if (responseHeader) {
-                wsStream.write(responseHeader);
-            }
+            if (responseHeader) wsStream.write(responseHeader);
 
-            // 2. Connect to Target (Direct)
             const targetHost = protocolHeader.addressRemote;
             const targetPort = protocolHeader.portRemote;
-            log(`Connecting to ${targetHost}:${targetPort}`);
 
             if (protocolHeader.isUDP) {
-                 await handleUDPOutbound(
-                    targetHost, targetPort, protocolHeader.rawClientData,
-                    webSocket, wsStream, log
-                 );
+                 await handleUDPOutbound(targetHost, targetPort, protocolHeader.rawClientData, webSocket, wsStream, log);
             } else {
-                await handleTCPOutbound(
-                    targetHost, targetPort, protocolHeader.rawClientData,
-                    webSocket, wsStream, log
-                );
+                await handleTCPOutbound(targetHost, targetPort, protocolHeader.rawClientData, webSocket, wsStream, log);
             }
-
-        } catch (err) {
-            log(`Handshake Error: ${err.message}`);
-            webSocket.close();
-        }
+        } catch (err) { webSocket.close(); }
     });
-
     wsStream.on('error', (err) => log(`Stream Error: ${err.message}`));
 }
 
 async function handleTCPOutbound(addressRemote, portRemote, rawClientData, webSocket, wsStream, log) {
-    async function connectTarget(addr, port) {
-        const s = net.connect(port, addr);
+    try {
+        const s = net.connect(portRemote, addressRemote);
         s.setNoDelay(true);
         s.setKeepAlive(true);
-        await new Promise((res, rej) => {
-            s.once('connect', res);
-            s.once('error', rej);
-        });
-        return { socket: s };
-    }
+        await new Promise((res, rej) => { s.once('connect', res); s.once('error', rej); });
 
-    try {
-        const { socket: tcpSocket } = await connectTarget(addressRemote, portRemote);
+        if (rawClientData && rawClientData.length > 0) s.write(rawClientData);
 
-        if (rawClientData && rawClientData.length > 0) {
-            tcpSocket.write(rawClientData);
-        }
-
-        wsStream.pipe(tcpSocket);
-        tcpSocket.pipe(wsStream);
-
+        wsStream.pipe(s);
+        s.pipe(wsStream);
         wsStream.resume();
-
-        tcpSocket.on('error', (e) => log(`TCP Error: ${e.message}`));
-        tcpSocket.on('close', () => {
-            log("TCP Closed");
-            webSocket.close();
-        });
-
-    } catch (e) {
-        log(`Outbound Failed: ${e.message}`);
-        webSocket.close();
-    }
+        s.on('close', () => webSocket.close());
+    } catch (e) { webSocket.close(); }
 }
 
 async function handleUDPOutbound(targetAddress, targetPort, dataChunk, webSocket, wsStream, log) {
-    // For UDP, simply create a socket and write.
-    // In strict VLESS/Trojan UDP, we just pipe the datagrams if supported by the backend logic.
-    // Since we removed the relay, we act as a direct UDP forwarder if possible,
-    // BUT standard Node `net` doesn't handle UDP. We need `dgram`.
-    // However, VLESS over TCP/WS usually encapsulates UDP packets.
-    // If the target is a UDP service, we should use dgram.
-    // But usually for "Tunneling", we just treat it as a stream or use a UDP socket.
-
-    // NOTE: The previous code was using a specific Relay Server format `udp:ip:port|data`.
-    // Since the user said "Remove Proxy Route System", and the Relay was part of that "Proxy/Tunneling" logic
-    // (specifically to tunnel UDP over TCP/Proxy), we might need to fallback to standard behavior.
-    // Standard behavior for VLESS over WS is that the stream *contains* UDP packets if the command was UDP.
-    // But Node.js cannot "pipe" a WebSocket stream to a UDP socket directly because UDP is message-based.
-
-    // If we simply drop the Relay, we must implement a local UDP socket handler that reads from the stream,
-    // parses the length (if VLESS), sends to target, receives, wraps, and sends back.
-    // That is complex.
-    // Alternatively, since the user asked to remove "System Route Proxy", they might just want *TCP* functionality
-    // or they assume the "Good Setting" handles it.
-
-    // For now, I will use a simple UDP socket implementation that attempts to forward.
-    // But without packet length parsing, stream-to-UDP is impossible.
-    // Given the constraints and the removal of the Relay, I will implement a basic "Error: UDP not supported in direct mode without relay"
-    // OR keep the relay *only* for UDP if strictly necessary?
-    // "System rute proxy hapus aja" -> Delete the proxy route system.
-
-    // I will log that UDP is not fully supported in this simplified direct mode without the specific relay logic,
-    // or attempting to implement a basic one is risky without parsing libraries.
-    // I'll leave a placeholder or close connection for UDP to avoid "hanging".
-
-    log("UDP requested but Proxy/Relay system is removed. Closing.");
-    webSocket.close();
+    webSocket.close(); // UDP disabled as per previous request
 }
 
+// ... Protocol Parsers (Same as before) ...
 async function protocolSniffer(buffer) {
     if (buffer.length >= 18 && buffer[0] === 0) return atob(neko);
-    if (buffer.length >= 62) {
-        const d = buffer.slice(56, 60);
-        if (d[0]===0x0d && d[1]===0x0a) return atob(horse);
-    }
+    if (buffer.length >= 62) { const d = buffer.slice(56, 60); if (d[0]===0x0d && d[1]===0x0a) return atob(horse); }
     if (buffer.length >= 42) return atob(flash);
     return "";
 }
-
 function readHorseHeader(buffer) {
     if (buffer.length < 58) return { hasError: true };
     const hash = buffer.slice(0, 56).toString();
     const data = buffer.slice(58);
     if (data.length < 6) return { hasError: true };
-
     const cmd = data[0];
     const atype = data[1];
     let off = 2;
@@ -492,11 +451,9 @@ function readHorseHeader(buffer) {
     else if (atype === 3) { const l = data[off]; off++; addr = data.slice(off, off+l).toString(); off+=l; }
     else if (atype === 4) { off+=16; addr="ipv6"; }
     else return { hasError: true };
-
     const port = data.readUInt16BE(off);
     return { hasError: false, addressRemote: addr, portRemote: port, isUDP: cmd===3, rawClientData: data.slice(off+2), passwordHash: hash };
 }
-
 function readNekoHeader(buffer) {
     const ver = buffer[0];
     const optLen = buffer[17];
@@ -509,10 +466,8 @@ function readNekoHeader(buffer) {
     if (atype === 1) { addr = buffer.slice(off, off+4).join('.'); off+=4; }
     else if (atype === 2) { const l = buffer[off]; off++; addr = buffer.slice(off, off+l).toString(); off+=l; }
     else if (atype === 3) { off+=16; addr="ipv6"; }
-
     return { hasError: false, addressRemote: addr, portRemote: port, isUDP: cmd===2, rawClientData: buffer.slice(off), version: new Uint8Array([ver, 0]) };
 }
-
 async function readStreamHeader(buffer, uuid) {
     try {
         const keyBytes = new Uint8Array(uuid.replace(/-/g, "").match(/.{1,2}/g).map(b => parseInt(b, 16)));
@@ -520,17 +475,14 @@ async function readStreamHeader(buffer, uuid) {
         const authId = buffer.slice(0, 16);
         const encLen = buffer.slice(16, 34);
         const nonce = buffer.slice(34, 42);
-
         const lKey = (await kdf(authKey, [SALT_A1, authId, nonce])).slice(0, 16);
         const lIv = (await kdf(authKey, [SALT_A2, authId, nonce])).slice(0, 12);
         const lBytes = await aesGcmDecrypt(lKey, lIv, encLen, authId);
         const hLen = (lBytes[0] << 8) | lBytes[1];
-
         const encHead = buffer.slice(42, 42 + hLen + 16);
         const pKey = (await kdf(authKey, [SALT_A3, authId, nonce])).slice(0, 16);
         const pIv = (await kdf(authKey, [SALT_A4, authId, nonce])).slice(0, 12);
         const head = await aesGcmDecrypt(pKey, pIv, encHead, authId);
-
         const view = Buffer.from(head);
         let off = 0;
         const ver = view[off++];
@@ -543,11 +495,9 @@ async function readStreamHeader(buffer, uuid) {
         let addr = "";
         if (atype === 1) { addr = view.slice(off, off+4).join('.'); off+=4; }
         else if (atype === 2) { const l = view[off++]; addr = view.slice(off, off+l).toString(); off+=l; }
-
         return { hasError: false, addressRemote: addr, portRemote: port, isUDP: cmd!==1, rawClientData: buffer.slice(42+hLen+16), version: new Uint8Array([opts[0], 0]), encKey, encIv, needsResponse: true, responseOptions: opts };
     } catch(e) { return { hasError: true, message: e.message }; }
 }
-
 async function generateStreamResponseHeader(opts, key, iv) {
     try {
         const sKey = (await sha256(key)).slice(0, 16);
@@ -556,16 +506,13 @@ async function generateStreamResponseHeader(opts, key, iv) {
         const rLenIv = (await kdf(sIv, [SALT_B2])).slice(0, 12);
         const rLenData = new Uint8Array([0, 4]);
         const encLen = await aesGcmEncrypt(rLenKey, rLenIv, rLenData, new Uint8Array(0));
-
         const rHead = new Uint8Array([opts[0], 0, 0, 0]);
         const rHeadKey = (await kdf(sKey, [SALT_B3])).slice(0, 16);
         const rHeadIv = (await kdf(sIv, [SALT_B4])).slice(0, 12);
         const encHead = await aesGcmEncrypt(rHeadKey, rHeadIv, rHead, new Uint8Array(0));
-
         return Buffer.concat([encLen, encHead]);
     } catch(e) { return Buffer.alloc(0); }
 }
-
 async function md5(...args) { return new Uint8Array(createHash('md5').update(Buffer.concat(args.map(a=>Buffer.from(a)))).digest()); }
 async function sha256(d) { return new Uint8Array(await crypto.subtle.digest("SHA-256", d)); }
 async function aesGcmDecrypt(k, n, d, a) {
@@ -582,9 +529,7 @@ async function kdf(key, path) {
         return new Uint8Array(await crypto.subtle.sign("HMAC", key, d));
     }
     let result = key;
-    for (const p of path) {
-        result = await hmac(result, p);
-    }
+    for (const p of path) { result = await hmac(result, p); }
     return result;
 }
 
@@ -670,6 +615,7 @@ cat <<'EOF' > $INSTALL_DIR/public/index.html
             border-radius: 8px;
             margin-bottom: 4px;
             transition: all 0.2s;
+            cursor: pointer;
         }
 
         .nav-link:hover, .nav-link.active {
@@ -736,8 +682,43 @@ cat <<'EOF' > $INSTALL_DIR/public/index.html
             padding: 24px;
         }
 
-        .stat-label { color: var(--text-muted); font-size: 0.9rem; margin-bottom: 8px; }
-        .stat-value { font-size: 2rem; font-weight: 700; color: white; }
+        .stat-label { color: var(--text-muted); font-size: 0.9rem; margin-bottom: 8px; display: flex; justify-content: space-between; }
+        .stat-value { font-size: 1.5rem; font-weight: 700; color: white; }
+        .stat-sub { font-size: 0.8rem; color: var(--text-muted); margin-top: 4px; }
+
+        /* Progress Bar */
+        .progress-bg {
+            background-color: var(--bg-input);
+            height: 6px;
+            border-radius: 3px;
+            margin-top: 12px;
+            overflow: hidden;
+        }
+        .progress-fill {
+            height: 100%;
+            background-color: var(--primary);
+            width: 0%;
+            transition: width 0.5s ease;
+        }
+
+        /* Traffic Bar */
+        .traffic-card {
+            background-color: var(--bg-panel);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 24px;
+            margin-bottom: 32px;
+        }
+        .traffic-header { display: flex; justify-content: space-between; margin-bottom: 16px; }
+        .traffic-bars { display: flex; height: 40px; gap: 4px; align-items: flex-end; }
+        .t-bar {
+            flex: 1;
+            background-color: rgba(59, 130, 246, 0.2);
+            border-radius: 2px;
+            transition: height 0.2s;
+            min-height: 4px;
+        }
+        .t-bar.active { background-color: var(--primary); }
 
         /* Table */
         .table-container {
@@ -845,6 +826,13 @@ cat <<'EOF' > $INSTALL_DIR/public/index.html
         }
         .form-group input:focus, .form-group select:focus { border-color: var(--primary); }
 
+        /* Tabs */
+        .tabs { display: flex; gap: 10px; margin-bottom: 20px; border-bottom: 1px solid var(--border); }
+        .tab { padding: 10px; color: var(--text-muted); cursor: pointer; border-bottom: 2px solid transparent; }
+        .tab.active { color: var(--primary); border-bottom-color: var(--primary); }
+        .tab-content { display: none; }
+        .tab-content.active { display: block; }
+
         /* Mobile */
         .mobile-toggle { display: none; color: white; font-size: 1.5rem; cursor: pointer; }
 
@@ -854,7 +842,7 @@ cat <<'EOF' > $INSTALL_DIR/public/index.html
             .main { margin-left: 0; padding: 20px; }
             .mobile-toggle { display: block; margin-right: 16px; }
             .table-container { overflow-x: auto; }
-            .header-actions { display: none; } /* Hide profile on mobile to save space */
+            .header-actions { display: none; }
         }
 
         /* Toast */
@@ -881,9 +869,8 @@ cat <<'EOF' > $INSTALL_DIR/public/index.html
             <i class="fa-solid fa-bolt"></i> RUTE PREMIUM
         </div>
         <div class="nav-links">
-            <a href="#" class="nav-link active"><i class="fa-solid fa-grid-2"></i> Dashboard</a>
-            <a href="#" class="nav-link"><i class="fa-solid fa-users"></i> Users</a>
-            <!-- Removed Proxies Link as requested -->
+            <a onclick="showSection('dashboard')" class="nav-link active"><i class="fa-solid fa-grid-2"></i> Dashboard</a>
+            <a onclick="showSection('settings')" class="nav-link"><i class="fa-solid fa-gear"></i> Settings</a>
             <div style="margin-top: auto; padding-top: 20px; border-top: 1px solid var(--border);">
                 <a href="#" class="nav-link" onclick="updateSystem()"><i class="fa-solid fa-cloud-arrow-down"></i> Update System</a>
                 <a href="#" class="nav-link" onclick="location.reload()"><i class="fa-solid fa-rotate"></i> Refresh</a>
@@ -891,61 +878,134 @@ cat <<'EOF' > $INSTALL_DIR/public/index.html
         </div>
     </nav>
 
-    <main class="main">
-        <div class="header">
-            <div style="display:flex; align-items:center;">
-                <div class="mobile-toggle" onclick="toggleSidebar()"><i class="fa-solid fa-bars"></i></div>
-                <div class="title">
-                    <h1>Dashboard</h1>
-                    <p>Manage your VLESS/VMess/Trojan Accounts</p>
+    <main class="main" id="main-content">
+        <!-- Dashboard Section -->
+        <div id="section-dashboard">
+            <div class="header">
+                <div style="display:flex; align-items:center;">
+                    <div class="mobile-toggle" onclick="toggleSidebar()"><i class="fa-solid fa-bars"></i></div>
+                    <div class="title">
+                        <h1>Dashboard</h1>
+                        <p>System Overview & User Management</p>
+                    </div>
+                </div>
+                <div class="header-actions">
+                    <button class="btn btn-primary" onclick="openModal('createModal')">
+                        <i class="fa-solid fa-plus"></i> New User
+                    </button>
                 </div>
             </div>
-            <div class="header-actions">
-                <button class="btn btn-primary" onclick="openModal()">
-                    <i class="fa-solid fa-plus"></i> New User
-                </button>
+
+            <div class="stats-grid">
+                <div class="stat-card">
+                    <div class="stat-label">Public IP <i class="fa-solid fa-globe"></i></div>
+                    <div class="stat-value" id="stat-ip" style="font-size: 1.2rem;">Loading...</div>
+                    <div class="stat-sub">VPS Address</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">CPU Load <i class="fa-solid fa-microchip"></i></div>
+                    <div class="stat-value" id="stat-cpu">0%</div>
+                    <div class="progress-bg"><div class="progress-fill" id="prog-cpu" style="width: 0%"></div></div>
+                    <div class="stat-sub" id="stat-cores">Loading Cores...</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">RAM Usage <i class="fa-solid fa-memory"></i></div>
+                    <div class="stat-value" id="stat-ram">0%</div>
+                    <div class="progress-bg"><div class="progress-fill" id="prog-ram" style="width: 0%; background-color: var(--warning);"></div></div>
+                    <div class="stat-sub" id="stat-mem-det">Loading...</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Network I/O <i class="fa-solid fa-network-wired"></i></div>
+                    <div class="stat-value" id="stat-net" style="font-size: 1.2rem;">0 KB/s</div>
+                    <div class="stat-sub">Total RX/TX</div>
+                </div>
+            </div>
+
+            <div class="traffic-card">
+                <div class="traffic-header">
+                    <h3>Live Traffic</h3>
+                    <span style="color: var(--text-muted); font-size: 0.9rem;">Real-time Network Load (Mbps)</span>
+                </div>
+                <div class="traffic-bars" id="traffic-bars">
+                    <!-- 30 bars generated via JS -->
+                </div>
+            </div>
+
+            <div class="table-container">
+                <div class="table-header">
+                    <h3>User List</h3>
+                    <div class="search-box">
+                        <i class="fa-solid fa-search"></i>
+                        <input type="text" placeholder="Search user..." id="search" onkeyup="filterUsers()">
+                    </div>
+                </div>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Username</th>
+                            <th>Protocol</th>
+                            <th>UUID / Password</th>
+                            <th>Expiry</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody id="user-table-body">
+                    </tbody>
+                </table>
             </div>
         </div>
 
-        <div class="stats-grid">
-            <div class="stat-card">
-                <div class="stat-label">Total Users</div>
-                <div class="stat-value" id="stat-total">0</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-label">Active Protocols</div>
-                <div class="stat-value">3</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-label">System Status</div>
-                <div class="stat-value" style="color: var(--success); font-size: 1.5rem;">
-                    <i class="fa-solid fa-circle-check"></i> Online
+        <!-- Settings Section -->
+        <div id="section-settings" style="display: none;">
+            <div class="header">
+                <div style="display:flex; align-items:center;">
+                    <div class="mobile-toggle" onclick="toggleSidebar()"><i class="fa-solid fa-bars"></i></div>
+                    <div class="title">
+                        <h1>Settings</h1>
+                        <p>Server Configuration</p>
+                    </div>
                 </div>
             </div>
-        </div>
 
-        <div class="table-container">
-            <div class="table-header">
-                <h3>User List</h3>
-                <div class="search-box">
-                    <i class="fa-solid fa-search"></i>
-                    <input type="text" placeholder="Search user..." id="search" onkeyup="filterUsers()">
+            <div class="modal" style="width: 100%; max-width: 600px; box-shadow: none;">
+                <div class="tabs">
+                    <div class="tab active" onclick="switchTab('domain')">Domain</div>
+                    <div class="tab" onclick="switchTab('password')">Password</div>
+                    <div class="tab" onclick="switchTab('reboot')">Auto Reboot</div>
+                </div>
+
+                <div id="tab-domain" class="tab-content active">
+                    <form onsubmit="handleSettings('domain', event)">
+                        <div class="form-group">
+                            <label>Server Domain</label>
+                            <input type="text" id="set_domain" placeholder="vpn.example.com" required>
+                            <small style="color: var(--text-muted)">Changes will update Caddyfile and restart the web server.</small>
+                        </div>
+                        <button type="submit" class="btn btn-primary">Save Domain</button>
+                    </form>
+                </div>
+
+                <div id="tab-password" class="tab-content">
+                    <form onsubmit="handleSettings('password', event)">
+                        <div class="form-group">
+                            <label>New Admin Password</label>
+                            <input type="password" id="set_password" required>
+                        </div>
+                        <button type="submit" class="btn btn-primary">Update Password</button>
+                    </form>
+                </div>
+
+                <div id="tab-reboot" class="tab-content">
+                    <form onsubmit="handleSettings('reboot', event)">
+                        <div class="form-group">
+                            <label>Reboot Time (Server Time)</label>
+                            <input type="time" id="set_reboot" required>
+                            <small style="color: var(--text-muted)">Schedules a daily cron job to reboot the VPS.</small>
+                        </div>
+                        <button type="submit" class="btn btn-danger">Set Reboot Schedule</button>
+                    </form>
                 </div>
             </div>
-            <table>
-                <thead>
-                    <tr>
-                        <th>Username</th>
-                        <th>Protocol</th>
-                        <th>UUID / Password</th>
-                        <th>Expiry</th>
-                        <th>Actions</th>
-                    </tr>
-                </thead>
-                <tbody id="user-table-body">
-                    <!-- Data Injected Here -->
-                </tbody>
-            </table>
         </div>
     </main>
 
@@ -966,7 +1026,6 @@ cat <<'EOF' > $INSTALL_DIR/public/index.html
                         <option value="trojan">TROJAN</option>
                     </select>
                 </div>
-                <!-- Proxy Route Inputs Removed -->
                 <div class="form-group">
                     <label>Duration</label>
                     <select id="in_days">
@@ -976,7 +1035,7 @@ cat <<'EOF' > $INSTALL_DIR/public/index.html
                     </select>
                 </div>
                 <div style="display: flex; justify-content: flex-end; gap: 12px;">
-                    <button type="button" class="btn" style="background: var(--bg-input); color: white;" onclick="closeModal()">Cancel</button>
+                    <button type="button" class="btn" style="background: var(--bg-input); color: white;" onclick="closeModal('createModal')">Cancel</button>
                     <button type="submit" class="btn btn-primary">Create</button>
                 </div>
             </form>
@@ -986,81 +1045,166 @@ cat <<'EOF' > $INSTALL_DIR/public/index.html
     <div id="toast-container"></div>
 
     <script>
-        const API_URL = '/api/users';
+        const API_USERS = '/api/users';
+        const API_STATS = '/api/stats';
         let allUsers = [];
+        let statsInterval;
 
         // Init
-        document.addEventListener('DOMContentLoaded', loadData);
+        document.addEventListener('DOMContentLoaded', () => {
+            loadData();
+            initTrafficBar();
+            startStatsLoop();
+        });
 
-        function toggleSidebar() {
-            document.getElementById('sidebar').classList.toggle('open');
+        function toggleSidebar() { document.getElementById('sidebar').classList.toggle('open'); }
+        function openModal(id) { document.getElementById(id).classList.add('active'); }
+        function closeModal(id) { document.getElementById(id).classList.remove('active'); }
+
+        function showSection(name) {
+            document.querySelectorAll('.nav-link').forEach(l => l.classList.remove('active'));
+            event.currentTarget.classList.add('active'); // assuming click
+
+            document.getElementById('section-dashboard').style.display = name === 'dashboard' ? 'block' : 'none';
+            document.getElementById('section-settings').style.display = name === 'settings' ? 'block' : 'none';
         }
 
-        function openModal() {
-            document.getElementById('createModal').classList.add('active');
-        }
-        function closeModal() {
-            document.getElementById('createModal').classList.remove('active');
+        function switchTab(name) {
+            document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+            document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+            event.target.classList.add('active');
+            document.getElementById(`tab-${name}`).classList.add('active');
         }
 
-        async function updateSystem() {
-            if(!confirm("Are you sure you want to update the system from GitHub? The service will restart.")) return;
+        // --- System Stats ---
+        function startStatsLoop() {
+            fetchStats();
+            statsInterval = setInterval(fetchStats, 2000);
+        }
+
+        async function fetchStats() {
             try {
-                showToast("Updating system...", "success");
-                const res = await fetch('/api/update', { method: 'POST' });
+                const res = await fetch(API_STATS);
+                if (!res.ok) return;
                 const data = await res.json();
-                if(data.success) {
-                    showToast(data.message);
-                    setTimeout(() => location.reload(), 3000);
-                } else {
-                    showToast("Update failed: " + data.message, "error");
+
+                // IP
+                document.getElementById('stat-ip').innerText = data.ip;
+
+                // CPU
+                document.getElementById('stat-cpu').innerText = data.cpu.usage + '%';
+                document.getElementById('prog-cpu').style.width = data.cpu.usage + '%';
+                document.getElementById('stat-cores').innerText = `${data.cpu.cores} Cores Detected`;
+
+                // RAM
+                const usedMem = ((data.ram.total - data.ram.free) / 1024 / 1024 / 1024).toFixed(1);
+                const totalMem = (data.ram.total / 1024 / 1024 / 1024).toFixed(1);
+                document.getElementById('stat-ram').innerText = data.ram.usage + '%';
+                document.getElementById('prog-ram').style.width = data.ram.usage + '%';
+                document.getElementById('stat-mem-det').innerText = `${usedMem}GB / ${totalMem}GB`;
+
+                // Net
+                const txMbps = (data.net.tx / 1024 / 1024 * 8).toFixed(1); // approx since last boot, but we want rate?
+                // Note: /api/stats returns cumulative. We need to diff in JS to get rate.
+                // For simplicity, let's just show cumulative for now or implement rate logic in JS.
+                // Rate Logic:
+                if (window.lastNet) {
+                    const diffTx = data.net.tx - window.lastNet.tx;
+                    const speed = ((diffTx / 2) / 1024).toFixed(1); // KB/s over 2s
+                    document.getElementById('stat-net').innerText = `${speed} KB/s`;
+                    updateTrafficBar(speed); // Visualize
                 }
-            } catch(e) {
-                showToast("Update error: " + e.message, "error");
+                window.lastNet = data.net;
+
+            } catch(e) { console.error(e); }
+        }
+
+        function initTrafficBar() {
+            const container = document.getElementById('traffic-bars');
+            for(let i=0; i<30; i++) {
+                const bar = document.createElement('div');
+                bar.className = 't-bar';
+                container.appendChild(bar);
             }
+        }
+
+        function updateTrafficBar(kbs) {
+            const bars = document.querySelectorAll('.t-bar');
+            // Shift height logic simulates a scrolling chart
+            // Simple: just update a random bar? No, slide.
+            // Actually, let's just make the rightmost bar represent current load
+            // and shift values left.
+            // Simplified: Just randomize visual for "activity" based on load level
+            const load = Math.min(100, kbs / 10); // scale 1000KB/s = 100% height
+
+            // Shift heights
+            for(let i=0; i<bars.length-1; i++) {
+                bars[i].style.height = bars[i+1].style.height;
+                if (parseInt(bars[i].style.height) > 20) bars[i].classList.add('active');
+                else bars[i].classList.remove('active');
+            }
+            const last = bars[bars.length-1];
+            last.style.height = Math.max(4, load) + '%';
+        }
+
+        // --- Settings Actions ---
+        async function handleSettings(type, e) {
+            e.preventDefault();
+            const payload = {};
+
+            if (type === 'domain') payload.domain = document.getElementById('set_domain').value;
+            if (type === 'password') payload.password = document.getElementById('set_password').value;
+            if (type === 'reboot') payload.time = document.getElementById('set_reboot').value;
+
+            try {
+                showToast(`Updating ${type}...`, 'success');
+                const res = await fetch(`/api/settings/${type}`, {
+                    method: 'POST',
+                    body: JSON.stringify(payload)
+                });
+                const data = await res.json();
+                if (data.success) showToast('Settings saved successfully!');
+                else showToast('Error: ' + data.error, 'error');
+            } catch(e) { showToast('Connection Error', 'error'); }
+        }
+
+        // --- Existing User Logic ---
+        async function updateSystem() {
+            if(!confirm("Update system from GitHub?")) return;
+            try {
+                showToast("Updating...", "success");
+                await fetch('/api/update', { method: 'POST' });
+                showToast("Done. Reloading...");
+                setTimeout(() => location.reload(), 3000);
+            } catch(e) { showToast("Error", "error"); }
         }
 
         async function loadData() {
             try {
-                const res = await fetch(API_URL);
-                if (res.status === 401) {
-                    window.location.href = '/login.html';
-                    return;
-                }
+                const res = await fetch(API_USERS);
+                if (res.status === 401) { window.location.href = '/login.html'; return; }
                 allUsers = await res.json();
                 renderTable(allUsers);
                 document.getElementById('stat-total').innerText = allUsers.length;
-            } catch(e) {
-                showToast(e.message, 'error');
-            }
+            } catch(e) { showToast(e.message, 'error'); }
         }
 
         function renderTable(users) {
             const tbody = document.getElementById('user-table-body');
             tbody.innerHTML = '';
-
-            if (users.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="6" style="text-align:center; padding: 30px;">No users found.</td></tr>';
-                return;
-            }
+            if (users.length === 0) { tbody.innerHTML = '<tr><td colspan="5" style="text-align:center; padding: 30px;">No users found.</td></tr>'; return; }
 
             users.forEach(u => {
                 const tr = document.createElement('tr');
                 const expiry = new Date(u.expiredDate).toLocaleDateString();
-                // Removed Proxy Display Column
-
                 tr.innerHTML = `
                     <td><b>${u.username}</b></td>
                     <td><span class="badge badge-${u.protocol}">${u.protocol.toUpperCase()}</span></td>
                     <td style="font-family: monospace; color: var(--text-muted);">${u.uuid.substring(0,8)}...</td>
                     <td>${expiry}</td>
                     <td>
-                        <button class="btn btn-primary btn-sm" onclick="copyConfig('${u.uuid}', '${u.protocol}', '${u.username}')">
-                            <i class="fa-regular fa-copy"></i>
-                        </button>
-                        <button class="btn btn-danger btn-sm" onclick="deleteUser('${u.uuid}')">
-                            <i class="fa-solid fa-trash"></i>
-                        </button>
+                        <button class="btn btn-primary btn-sm" onclick="copyConfig('${u.uuid}', '${u.protocol}', '${u.username}')"><i class="fa-regular fa-copy"></i></button>
+                        <button class="btn btn-danger btn-sm" onclick="deleteUser('${u.uuid}')"><i class="fa-solid fa-trash"></i></button>
                     </td>
                 `;
                 tbody.appendChild(tr);
@@ -1075,10 +1219,8 @@ cat <<'EOF' > $INSTALL_DIR/public/index.html
 
         async function createUser(e) {
             e.preventDefault();
-
             const username = document.getElementById('in_username').value;
             const protocol = document.getElementById('in_protocol').value;
-            // Proxy inputs removed
             const days = document.getElementById('in_days').value;
 
             const uuid = 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
@@ -1088,57 +1230,33 @@ cat <<'EOF' > $INSTALL_DIR/public/index.html
 
             const date = new Date();
             date.setDate(date.getDate() + parseInt(days));
-
             const payload = { username, protocol, uuid, days, expiredDate: date.toISOString() };
 
             try {
-                const res = await fetch(API_URL, {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify(payload)
-                });
-                if (res.ok) {
-                    showToast('User created successfully');
-                    closeModal();
-                    loadData();
-                    e.target.reset();
-                } else {
-                    showToast('Failed to create user', 'error');
-                }
+                const res = await fetch(API_USERS, { method: 'POST', body: JSON.stringify(payload) });
+                if (res.ok) { showToast('User created'); closeModal('createModal'); loadData(); e.target.reset(); }
+                else showToast('Failed', 'error');
             } catch(e) { showToast(e.message, 'error'); }
         }
 
         async function deleteUser(uuid) {
-            if(!confirm('Are you sure you want to delete this user?')) return;
-            try {
-                const res = await fetch(`${API_URL}/${uuid}`, { method: 'DELETE' });
-                if (res.ok) {
-                    showToast('User deleted');
-                    loadData();
-                }
-            } catch(e) { showToast(e.message, 'error'); }
+            if(!confirm('Delete user?')) return;
+            await fetch(`${API_USERS}/${uuid}`, { method: 'DELETE' });
+            showToast('User deleted'); loadData();
         }
 
         function copyConfig(uuid, protocol, username) {
             const host = window.location.hostname;
             const port = 443;
-
-            // Dynamic Path Logic (Simple now)
-            let path = `/${protocol}`; // Default: /vless, /vmess, /trojan
-
+            let path = `/${protocol}`;
             let link = '';
-            if (protocol === 'vless') {
-                link = `vless://${uuid}@${host}:${port}?encryption=none&security=tls&type=ws&host=${host}&path=${encodeURIComponent(path)}#${encodeURIComponent(username)}`;
-            } else if (protocol === 'vmess') {
-                const vmessJson = {
-                    v: "2", ps: username, add: host, port: port, id: uuid, aid: "0", scy: "auto", net: "ws", type: "none", host: host, path: path, tls: "tls"
-                };
+            if (protocol === 'vless') link = `vless://${uuid}@${host}:${port}?encryption=none&security=tls&type=ws&host=${host}&path=${encodeURIComponent(path)}#${encodeURIComponent(username)}`;
+            else if (protocol === 'vmess') {
+                const vmessJson = { v: "2", ps: username, add: host, port: port, id: uuid, aid: "0", scy: "auto", net: "ws", type: "none", host: host, path: path, tls: "tls" };
                 link = `vmess://${btoa(JSON.stringify(vmessJson))}`;
-            } else if (protocol === 'trojan') {
-                link = `trojan://${uuid}@${host}:${port}?security=tls&type=ws&host=${host}&path=${encodeURIComponent(path)}#${encodeURIComponent(username)}`;
-            }
+            } else if (protocol === 'trojan') link = `trojan://${uuid}@${host}:${port}?security=tls&type=ws&host=${host}&path=${encodeURIComponent(path)}#${encodeURIComponent(username)}`;
 
-            navigator.clipboard.writeText(link).then(() => showToast('Config copied to clipboard'));
+            navigator.clipboard.writeText(link).then(() => showToast('Copied!'));
         }
 
         function showToast(msg, type = 'success') {

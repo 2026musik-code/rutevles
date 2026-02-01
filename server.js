@@ -15,10 +15,7 @@ const horse = "dHJvamFu";
 const flash = "dm1lc3M=";
 const neko = "dmxlc3M=";
 
-const RELAY_SERVER_UDP = {
-  host: "udp-relay.hobihaus.space",
-  port: 7300,
-};
+// Relay removed as we are going direct
 const PRX_HEALTH_CHECK_API = "https://id1.foolvpn.web.id/api/v1/check";
 const CORS_HEADER_OPTIONS = {
   "Access-Control-Allow-Origin": "*",
@@ -27,7 +24,6 @@ const CORS_HEADER_OPTIONS = {
   "Access-Control-Allow-Headers": "Content-Type, Authorization"
 };
 
-// ... Crypto Constants ...
 const SALT_A1 = atob("Vk1lc3MgSGVhZGVyIEFFQUQgS2V5X0xlbmd0aA==");
 const SALT_A2 = atob("Vk1lc3MgSGVhZGVyIEFFQUQgTm9uY2VfTGVuZ3Ro");
 const SALT_A3 = atob("Vk1lc3MgSGVhZGVyIEFFQUQgS2V5");
@@ -233,28 +229,12 @@ const server = http.createServer(async (req, res) => {
 const wss = new WebSocket.Server({ noServer: true });
 
 server.on('upgrade', async (request, socket, head) => {
-    const url = new URL(request.url, `http://${request.headers.host}`);
-    let prxIP = "";
-    const proxyType = url.searchParams.get("proxyType") || "";
-
-    // Check for ProxyIP in Query Params first (cleaner URLs)
-    const qProxy = url.searchParams.get("proxyip");
-    if (qProxy) {
-        prxIP = qProxy;
-    } else {
-        // Fallback to path-based ProxyIP (legacy support)
-        let pathSegment = url.pathname.substring(1);
-        if (pathSegment && (pathSegment.includes(':') || pathSegment.includes('=') || pathSegment.includes('-'))) {
-             prxIP = pathSegment;
-        }
-    }
-
     wss.handleUpgrade(request, socket, head, (ws) => {
-        websocketHandler(ws, request, prxIP, proxyType);
+        websocketHandler(ws, request);
     });
 });
 
-async function websocketHandler(webSocket, request, prxIP, proxyType) {
+async function websocketHandler(webSocket, request) {
     const wsStream = WebSocket.createWebSocketStream(webSocket);
     const log = (msg) => console.log(`[WS] ${msg}`);
 
@@ -308,7 +288,7 @@ async function websocketHandler(webSocket, request, prxIP, proxyType) {
                 return;
             }
 
-            // 1. Send Response Header IMMEDIATELY to the stream
+            // 1. Send Response Header
             let responseHeader = protocolHeader.version;
             if (protocol === atob(flash) && protocolHeader.needsResponse) {
                  responseHeader = await generateStreamResponseHeader(
@@ -322,7 +302,7 @@ async function websocketHandler(webSocket, request, prxIP, proxyType) {
                 wsStream.write(responseHeader);
             }
 
-            // 2. Connect to Target
+            // 2. Connect to Target (Direct)
             const targetHost = protocolHeader.addressRemote;
             const targetPort = protocolHeader.portRemote;
             log(`Connecting to ${targetHost}:${targetPort}`);
@@ -330,12 +310,12 @@ async function websocketHandler(webSocket, request, prxIP, proxyType) {
             if (protocolHeader.isUDP) {
                  await handleUDPOutbound(
                     targetHost, targetPort, protocolHeader.rawClientData,
-                    webSocket, wsStream, log, RELAY_SERVER_UDP, prxIP, proxyType
+                    webSocket, wsStream, log
                  );
             } else {
                 await handleTCPOutbound(
                     targetHost, targetPort, protocolHeader.rawClientData,
-                    webSocket, wsStream, log, prxIP, proxyType
+                    webSocket, wsStream, log
                 );
             }
 
@@ -348,59 +328,20 @@ async function websocketHandler(webSocket, request, prxIP, proxyType) {
     wsStream.on('error', (err) => log(`Stream Error: ${err.message}`));
 }
 
-async function handleTCPOutbound(addressRemote, portRemote, rawClientData, webSocket, wsStream, log, prxIP, proxyType) {
+async function handleTCPOutbound(addressRemote, portRemote, rawClientData, webSocket, wsStream, log) {
     async function connectTarget(addr, port) {
-        if (proxyType) {
-            if (!prxIP) throw new Error("ProxyType set but no ProxyIP provided");
-            let sepIdx = -1;
-            if (prxIP.includes('=')) sepIdx = prxIP.lastIndexOf('=');
-            else if (prxIP.includes('-')) sepIdx = prxIP.lastIndexOf('-');
-            else sepIdx = prxIP.lastIndexOf(':');
-
-            if (sepIdx === -1) throw new Error("Invalid Proxy IP format");
-            const pAddr = prxIP.substring(0, sepIdx);
-            const pPort = parseInt(prxIP.substring(sepIdx + 1));
-
-            const socket = net.connect(pPort, pAddr);
-            // Optimization: Speed & Ping
-            socket.setNoDelay(true);
-            socket.setKeepAlive(true);
-
-            await new Promise((res, rej) => {
-                socket.once('connect', res);
-                socket.once('error', rej);
-            });
-
-            if (proxyType === 'http') return await httpProxyConnect(socket, addr, port);
-            else return await socks5Connect(socket, addr, port);
-        } else {
-             if (prxIP && !proxyType) { // Relay
-                 let sepIdx = -1;
-                 if (prxIP.includes('=')) sepIdx = prxIP.lastIndexOf('=');
-                 else if (prxIP.includes('-')) sepIdx = prxIP.lastIndexOf('-');
-                 else sepIdx = prxIP.lastIndexOf(':');
-                 if (sepIdx !== -1) {
-                     const pAddr = prxIP.substring(0, sepIdx);
-                     const pPort = parseInt(prxIP.substring(sepIdx + 1));
-                     const s = net.connect(pPort, pAddr);
-                     s.setNoDelay(true);
-                     s.setKeepAlive(true);
-                     return { socket: s, leftover: null };
-                 }
-            }
-            const s = net.connect(port, addr);
-            s.setNoDelay(true); // Disable Nagle's algorithm for speed
-            s.setKeepAlive(true); // Keep connection alive for better ping on idle
-            return { socket: s, leftover: null };
-        }
+        const s = net.connect(port, addr);
+        s.setNoDelay(true);
+        s.setKeepAlive(true);
+        await new Promise((res, rej) => {
+            s.once('connect', res);
+            s.once('error', rej);
+        });
+        return { socket: s };
     }
 
     try {
-        const { socket: tcpSocket, leftover } = await connectTarget(addressRemote, portRemote);
-
-        if (leftover && leftover.length > 0) {
-            tcpSocket.write(leftover);
-        }
+        const { socket: tcpSocket } = await connectTarget(addressRemote, portRemote);
 
         if (rawClientData && rawClientData.length > 0) {
             tcpSocket.write(rawClientData);
@@ -423,121 +364,39 @@ async function handleTCPOutbound(addressRemote, portRemote, rawClientData, webSo
     }
 }
 
-async function handleUDPOutbound(targetAddress, targetPort, dataChunk, webSocket, wsStream, log, relay, prxIP, proxyType) {
-    try {
-        let socket;
-         if (proxyType) {
-             const { socket: s } = await connectTarget(relay.host, relay.port, prxIP, proxyType);
-             socket = s;
-         } else {
-             socket = net.connect(relay.port, relay.host);
-             socket.setNoDelay(true);
-             socket.setKeepAlive(true);
-         }
+async function handleUDPOutbound(targetAddress, targetPort, dataChunk, webSocket, wsStream, log) {
+    // For UDP, simply create a socket and write.
+    // In strict VLESS/Trojan UDP, we just pipe the datagrams if supported by the backend logic.
+    // Since we removed the relay, we act as a direct UDP forwarder if possible,
+    // BUT standard Node `net` doesn't handle UDP. We need `dgram`.
+    // However, VLESS over TCP/WS usually encapsulates UDP packets.
+    // If the target is a UDP service, we should use dgram.
+    // But usually for "Tunneling", we just treat it as a stream or use a UDP socket.
 
-        // Initial Payload
-        const header = `udp:${targetAddress}:${targetPort}`;
-        const payload = Buffer.concat([Buffer.from(header), Buffer.from([0x7c]), Buffer.from(dataChunk)]);
-        socket.write(payload);
+    // NOTE: The previous code was using a specific Relay Server format `udp:ip:port|data`.
+    // Since the user said "Remove Proxy Route System", and the Relay was part of that "Proxy/Tunneling" logic
+    // (specifically to tunnel UDP over TCP/Proxy), we might need to fallback to standard behavior.
+    // Standard behavior for VLESS over WS is that the stream *contains* UDP packets if the command was UDP.
+    // But Node.js cannot "pipe" a WebSocket stream to a UDP socket directly because UDP is message-based.
 
-        wsStream.pipe(socket);
-        socket.pipe(wsStream);
-        wsStream.resume();
+    // If we simply drop the Relay, we must implement a local UDP socket handler that reads from the stream,
+    // parses the length (if VLESS), sends to target, receives, wraps, and sends back.
+    // That is complex.
+    // Alternatively, since the user asked to remove "System Route Proxy", they might just want *TCP* functionality
+    // or they assume the "Good Setting" handles it.
 
-        socket.on('error', (e) => log(`UDP Error: ${e.message}`));
-    } catch(e) {
-        log(`UDP Setup Error: ${e.message}`);
-        webSocket.close();
-    }
+    // For now, I will use a simple UDP socket implementation that attempts to forward.
+    // But without packet length parsing, stream-to-UDP is impossible.
+    // Given the constraints and the removal of the Relay, I will implement a basic "Error: UDP not supported in direct mode without relay"
+    // OR keep the relay *only* for UDP if strictly necessary?
+    // "System rute proxy hapus aja" -> Delete the proxy route system.
 
-    // Helper needed for UDP function scope as well
-    async function connectTarget(host, port, prxIP, proxyType) {
-        if (proxyType) {
-            if (!prxIP) throw new Error("ProxyType set but no ProxyIP provided");
-            let sepIdx = -1;
-            if (prxIP.includes('=')) sepIdx = prxIP.lastIndexOf('=');
-            else if (prxIP.includes('-')) sepIdx = prxIP.lastIndexOf('-');
-            else sepIdx = prxIP.lastIndexOf(':');
+    // I will log that UDP is not fully supported in this simplified direct mode without the specific relay logic,
+    // or attempting to implement a basic one is risky without parsing libraries.
+    // I'll leave a placeholder or close connection for UDP to avoid "hanging".
 
-            if (sepIdx === -1) throw new Error("Invalid Proxy IP format");
-            const pAddr = prxIP.substring(0, sepIdx);
-            const pPort = parseInt(prxIP.substring(sepIdx + 1));
-
-            const socket = net.connect(pPort, pAddr);
-            socket.setNoDelay(true);
-            socket.setKeepAlive(true);
-
-            await new Promise((res, rej) => {
-                socket.once('connect', res);
-                socket.once('error', rej);
-            });
-
-            if (proxyType === 'http') return await httpProxyConnect(socket, host, port);
-            else return await socks5Connect(socket, host, port);
-        } else {
-            const s = net.connect(port, host);
-            s.setNoDelay(true);
-            s.setKeepAlive(true);
-            return { socket: s, leftover: null };
-        }
-    }
-}
-
-// ... (Rest of Proxy/Protocol logic same as before) ...
-async function socks5Connect(socket, targetAddress, targetPort) {
-    return new Promise((resolve, reject) => {
-        const onHandshakeError = (err) => reject(err);
-        socket.once('error', onHandshakeError);
-        socket.write(new Uint8Array([0x05, 0x01, 0x00]));
-        socket.once('data', (data) => {
-            if (!data || data[0] !== 0x05 || data[1] !== 0x00) {
-                socket.removeListener('error', onHandshakeError);
-                return reject(new Error("SOCKS5 greeting failed"));
-            }
-            const portBuffer = Buffer.alloc(2);
-            portBuffer.writeUInt16BE(targetPort);
-            let addressType, addressBuffer;
-            if (net.isIPv4(targetAddress)) {
-                addressType = 0x01;
-                addressBuffer = Buffer.from(targetAddress.split('.').map(Number));
-            } else {
-                addressType = 0x03;
-                addressBuffer = Buffer.from([targetAddress.length, ...Buffer.from(targetAddress)]);
-            }
-            socket.write(Buffer.concat([Buffer.from([0x05, 0x01, 0x00, addressType]), addressBuffer, portBuffer]));
-
-            socket.once('data', (data2) => {
-                socket.removeListener('error', onHandshakeError);
-                if (!data2 || data2[0] !== 0x05 || data2[1] !== 0x00) return reject(new Error("SOCKS5 connection failed"));
-
-                let headerLen = 0;
-                if (data2[3] === 0x01) headerLen = 10;
-                else if (data2[3] === 0x04) headerLen = 22;
-                else if (data2[3] === 0x03) headerLen = 7 + data2[4];
-
-                let leftover = null;
-                if (data2.length > headerLen) leftover = data2.slice(headerLen);
-                resolve({ socket, leftover });
-            });
-        });
-    });
-}
-
-async function httpProxyConnect(socket, targetAddress, targetPort) {
-    return new Promise((resolve, reject) => {
-        const req = `CONNECT ${targetAddress}:${targetPort} HTTP/1.1\r\nHost: ${targetAddress}:${targetPort}\r\n\r\n`;
-        socket.write(req);
-        socket.once('data', (data) => {
-            if (data.toString().includes("200")) {
-                let leftover = null;
-                const idx = data.indexOf("\r\n\r\n");
-                if (idx !== -1 && idx + 4 < data.length) leftover = data.slice(idx + 4);
-                resolve({ socket, leftover });
-            }
-            else reject(new Error("HTTP Proxy failed"));
-        });
-        socket.once('error', reject);
-    });
+    log("UDP requested but Proxy/Relay system is removed. Closing.");
+    webSocket.close();
 }
 
 async function protocolSniffer(buffer) {

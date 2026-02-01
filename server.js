@@ -12,13 +12,9 @@ const CONFIG_FILE = path.join(__dirname, 'config.json');
 const horse = "dHJvamFu";
 const flash = "dm1lc3M=";
 const neko = "dmxlc3M=";
-// Removed SS to prevent open proxy
 
 const PORTS = [443, 80];
 const PROTOCOLS = [atob(horse), atob(flash), atob(neko)];
-const SUB_PAGE_URL = "https://foolvpn.web.id/nautica";
-const KV_PRX_URL = "https://raw.githubusercontent.com/FoolVPN-ID/Nautica/refs/heads/main/kvProxyList.json";
-const PRX_BANK_URL = "https://raw.githubusercontent.com/FoolVPN-ID/Nautica/refs/heads/main/proxyList.txt";
 const DNS_SERVER_ADDRESS = "8.8.8.8";
 const DNS_SERVER_PORT = 53;
 const RELAY_SERVER_UDP = {
@@ -26,7 +22,6 @@ const RELAY_SERVER_UDP = {
   port: 7300,
 };
 const PRX_HEALTH_CHECK_API = "https://id1.foolvpn.web.id/api/v1/check";
-const CONVERTER_URL = "https://api.foolvpn.web.id/convert";
 const CORS_HEADER_OPTIONS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET,HEAD,POST,DELETE,OPTIONS",
@@ -78,10 +73,8 @@ function isValidUser(uuid) {
     return true;
 }
 
-// -- Auth Helper --
 function checkAuth(req) {
-    if (!fs.existsSync(CONFIG_FILE)) return true; // Fail open if no config? No, fail secure.
-    // If no config file, default to admin:admin
+    if (!fs.existsSync(CONFIG_FILE)) return true;
     let config = { adminUser: 'admin', adminPass: 'admin' };
     try { config = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')); } catch {}
 
@@ -95,39 +88,13 @@ function checkAuth(req) {
     return false;
 }
 
-async function getKVPrxList(kvPrxUrl = KV_PRX_URL) {
-  if (!kvPrxUrl) throw new Error("No URL Provided!");
-  try {
-      const kvPrx = await fetch(kvPrxUrl);
-      if (kvPrx.status == 200) return await kvPrx.json();
-  } catch (e) { console.error(e); }
-  return {};
+async function checkPrxHealth(ip, port) {
+    try {
+        const res = await fetch(`${PRX_HEALTH_CHECK_API}?ip=${ip}:${port}`);
+        return await res.json();
+    } catch { return { error: "failed" }; }
 }
 
-async function getPrxList(prxBankUrl = PRX_BANK_URL) {
-  if (!prxBankUrl) throw new Error("No URL Provided!");
-  try {
-      const prxBank = await fetch(prxBankUrl);
-      if (prxBank.status == 200) {
-        const text = (await prxBank.text()) || "";
-        const prxString = text.split("\n").filter(Boolean);
-        cachedPrxList = prxString
-          .map((entry) => {
-            const [prxIP, prxPort, country, org] = entry.split(",");
-            return {
-              prxIP: prxIP || "Unknown",
-              prxPort: prxPort || "Unknown",
-              country: country || "Unknown",
-              org: org || "Unknown Org",
-            };
-          })
-          .filter(Boolean);
-      }
-  } catch(e) { console.error(e); }
-  return cachedPrxList;
-}
-
-// HTTP Server
 const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, `http://${req.headers.host}`);
 
@@ -138,13 +105,13 @@ const server = http.createServer(async (req, res) => {
         return;
     }
 
-    // --- PROTECTED ROUTES (Dashboard & API) ---
-    // Note: Public /sub links typically need to be open, but we keep them open for now.
-    // Dashboard and User API must be secured.
+    // --- PROTECTED ROUTES ---
+    // Protect EVERYTHING by default, except specific public endpoints
+    const isPublic =
+        url.pathname.startsWith("/check") ||
+        url.pathname.startsWith("/sub");
 
-    const isProtected = url.pathname.startsWith('/api/users') || url.pathname === '/' || url.pathname === '/index.html' || url.pathname.endsWith('.html');
-
-    if (isProtected) {
+    if (!isPublic) {
         if (!checkAuth(req)) {
             res.writeHead(401, { 'WWW-Authenticate': 'Basic realm="Nautica Admin"' });
             res.end('Access denied');
@@ -187,19 +154,31 @@ const server = http.createServer(async (req, res) => {
         return;
     }
 
-    // --- Static Files ---
-    if (url.pathname === '/' || url.pathname === '/index.html' || url.pathname.indexOf('.') > -1) {
-        let filePath = path.join(__dirname, 'public', url.pathname === '/' ? 'index.html' : url.pathname);
-        if (fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
-             const ext = path.extname(filePath);
-             const mime = { '.html': 'text/html', '.css': 'text/css', '.js': 'text/javascript' }[ext] || 'text/plain';
-             res.writeHead(200, { 'Content-Type': mime });
-             fs.createReadStream(filePath).pipe(res);
-             return;
-        }
+    // --- Static Files (SECURE LFI FIX) ---
+    // Normalize path and prevent directory traversal
+    let requestedPath = url.pathname === '/' ? '/index.html' : url.pathname;
+    // Remove query string
+    requestedPath = requestedPath.split('?')[0];
+
+    // Normalize logic
+    const publicDir = path.join(__dirname, 'public');
+    const safePath = path.normalize(path.join(publicDir, requestedPath));
+
+    // Check if path is actually inside publicDir
+    if (!safePath.startsWith(publicDir)) {
+        res.writeHead(403);
+        res.end("Forbidden");
+        return;
     }
 
-    // Fallback logic endpoints
+    if (fs.existsSync(safePath) && fs.statSync(safePath).isFile()) {
+         const ext = path.extname(safePath);
+         const mime = { '.html': 'text/html', '.css': 'text/css', '.js': 'text/javascript' }[ext] || 'text/plain';
+         res.writeHead(200, { 'Content-Type': mime });
+         fs.createReadStream(safePath).pipe(res);
+         return;
+    }
+
     if (url.pathname.startsWith("/check")) {
         const target = url.searchParams.get("target").split(":");
         try {
@@ -213,18 +192,10 @@ const server = http.createServer(async (req, res) => {
         return;
     }
 
-    if (url.pathname.startsWith("/sub")) {
-        // ... (Existing sub logic if needed, kept simple redirect for now as per previous step)
-        res.writeHead(301, { 'Location': SUB_PAGE_URL + `?host=${APP_DOMAIN}` });
-        res.end();
-        return;
-    }
-
     res.writeHead(404);
     res.end("Not Found");
 });
 
-// WebSocket Server
 const wss = new WebSocket.Server({ noServer: true });
 
 server.on('upgrade', async (request, socket, head) => {
@@ -281,7 +252,6 @@ async function websocketHandler(webSocket, request, prxIP, proxyType) {
                     protocolHeader = { hasError: true, message: "Authentication failed" };
                 }
             } else {
-                // Unknown or unsupported (SS removed)
                 throw new Error("Unknown Protocol");
             }
 
@@ -356,8 +326,6 @@ async function websocketHandler(webSocket, request, prxIP, proxyType) {
 
     wsStream.on('error', (err) => console.log("WS Stream Error", err.message));
 }
-
-// ... Proxy Connectors ...
 
 async function socks5Connect(socket, targetAddress, targetPort) {
     return new Promise((resolve, reject) => {
@@ -519,8 +487,6 @@ async function handleUDPOutbound(targetAddress, targetPort, dataChunk, webSocket
     }
 }
 
-// ... Parsers ...
-
 async function protocolSniffer(buffer) {
     if (buffer.length >= 62) {
         const horseDelimiter = buffer.slice(56, 60);
@@ -536,19 +502,17 @@ async function protocolSniffer(buffer) {
     }
     if (buffer.length >= 42) {
         const first = buffer[0];
-        if (first === 1 || first === 3 || first === 4) return "ss"; // Removed "ss" from sniffed return
+        if (first === 1 || first === 3 || first === 4) return "ss";
         return atob(flash);
     }
-    // Default fallback
     return "";
 }
 
-// Trojan Auth Helper
 function isValidTrojanUser(hashBuffer) {
     const receivedHash = hashBuffer.toString();
     const users = getUsers().filter(u => u.protocol === 'trojan');
     for (const user of users) {
-        const userHash = createHash('sha224').update(user.uuid).digest('hex'); // uuid used as password
+        const userHash = createHash('sha224').update(user.uuid).digest('hex');
         if (userHash === receivedHash) {
             const expDate = new Date(user.expiredDate);
             if (new Date() > expDate) return false;
@@ -639,7 +603,48 @@ function readNekoHeader(buffer) {
     };
 }
 
-// Removed readSsHeader from usage path
+function readSsHeader(ssBuffer) {
+  const view = ssBuffer;
+  const addressType = view[0];
+  let addressLength = 0;
+  let addressValueIndex = 1;
+  let addressValue = "";
+
+  switch (addressType) {
+    case 1:
+      addressLength = 4;
+      addressValue = view.slice(addressValueIndex, addressValueIndex + addressLength).join(".");
+      break;
+    case 3:
+      addressLength = view[addressValueIndex];
+      addressValueIndex += 1;
+      addressValue = view.slice(addressValueIndex, addressValueIndex + addressLength).toString();
+      break;
+    case 4:
+      addressLength = 16;
+      const ipv6 = [];
+      for (let i = 0; i < 8; i++) {
+        ipv6.push(view.readUInt16BE(addressValueIndex + i * 2).toString(16));
+      }
+      addressValue = ipv6.join(":");
+      break;
+    default:
+      return { hasError: true, message: `Invalid addressType for SS: ${addressType}` };
+  }
+
+  const portIndex = addressValueIndex + addressLength;
+  const portRemote = view.readUInt16BE(portIndex);
+  return {
+    hasError: false,
+    addressRemote: addressValue,
+    addressType: addressType,
+    portRemote: portRemote,
+    rawDataIndex: portIndex + 2,
+    rawClientData: ssBuffer.slice(portIndex + 2),
+    version: null,
+    isUDP: portRemote == 53,
+  };
+}
 
 async function readStreamHeader(buffer, userUUID) {
     try {
@@ -748,7 +753,6 @@ async function generateStreamResponseHeader(responseOptions, encKey, encIv) {
 
     return response;
   } catch (e) {
-    console.error("Failed to generate stream response:", e);
     return new Uint8Array(0);
   }
 }

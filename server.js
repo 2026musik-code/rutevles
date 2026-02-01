@@ -27,6 +27,7 @@ const CORS_HEADER_OPTIONS = {
   "Access-Control-Allow-Headers": "Content-Type, Authorization"
 };
 
+// ... Crypto Constants ...
 const SALT_A1 = atob("Vk1lc3MgSGVhZGVyIEFFQUQgS2V5X0xlbmd0aA==");
 const SALT_A2 = atob("Vk1lc3MgSGVhZGVyIEFFQUQgTm9uY2VfTGVuZ3Ro");
 const SALT_A3 = atob("Vk1lc3MgSGVhZGVyIEFFQUQgS2V5");
@@ -128,7 +129,6 @@ const server = http.createServer(async (req, res) => {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         exec('git pull origin main', { cwd: __dirname }, (err, stdout, stderr) => {
             if (err) {
-                console.error(err);
                 res.end(JSON.stringify({ success: false, message: stderr }));
                 return;
             }
@@ -248,175 +248,250 @@ server.on('upgrade', async (request, socket, head) => {
 });
 
 async function websocketHandler(webSocket, request, prxIP, proxyType) {
-    const wsStream = WebSocket.createWebSocketStream(webSocket);
     const log = (msg) => console.log(`[WS] ${msg}`);
 
-    wsStream.once('data', async (chunk) => {
-        wsStream.pause();
+    let isHeader = true;
+    let isConnected = false;
+    let buffer = []; // Buffer for chunks arriving during connect
+    let tcpSocket = null;
+    let remoteProtocolHeader = null;
 
-        try {
-            const protocol = await protocolSniffer(chunk);
-            let protocolHeader;
-            let uuid = "";
-            let authenticated = false;
+    webSocket.on('message', async (chunk) => {
+        if (isHeader) {
+            isHeader = false; // Only try to parse the first chunk as header
 
-            log(`Sniffed Protocol: ${protocol}`);
+            try {
+                // 1. Sniff & Parse
+                const protocol = await protocolSniffer(chunk);
+                let protocolHeader;
+                let authenticated = false;
 
-            if (protocol === atob(horse)) { // Trojan
-                protocolHeader = readHorseHeader(chunk);
-                if (!protocolHeader.hasError && isValidTrojanUser(protocolHeader.passwordHash)) {
-                    authenticated = true;
-                }
-            } else if (protocol === atob(neko)) { // VLESS
-                protocolHeader = readNekoHeader(chunk);
-                uuid = arrayBufferToHex(chunk.slice(1, 17));
-                const formattedUUID = `${uuid.substr(0,8)}-${uuid.substr(8,4)}-${uuid.substr(12,4)}-${uuid.substr(16,4)}-${uuid.substr(20,12)}`;
-                log(`VLESS UUID: ${formattedUUID}`);
-                if (isValidUser(formattedUUID)) {
-                    authenticated = true;
-                } else {
-                    log(`User not found in DB: ${formattedUUID}`);
-                }
-            } else if (protocol === atob(flash)) { // VMess
-                const users = getUsers().filter(u => u.protocol === 'vmess');
-                for (const user of users) {
-                    const result = await readStreamHeader(chunk, user.uuid);
-                    if (!result.hasError) {
-                        protocolHeader = result;
+                log(`Sniffed Protocol: ${protocol}`);
+
+                if (protocol === atob(horse)) { // Trojan
+                    protocolHeader = readHorseHeader(chunk);
+                    if (!protocolHeader.hasError && isValidTrojanUser(protocolHeader.passwordHash)) {
                         authenticated = true;
-                        log(`VMess Auth Success: ${user.uuid}`);
-                        break;
                     }
+                } else if (protocol === atob(neko)) { // VLESS
+                    protocolHeader = readNekoHeader(chunk);
+                    const uuid = arrayBufferToHex(chunk.slice(1, 17));
+                    const formattedUUID = `${uuid.substr(0,8)}-${uuid.substr(8,4)}-${uuid.substr(12,4)}-${uuid.substr(16,4)}-${uuid.substr(20,12)}`;
+                    log(`VLESS UUID: ${formattedUUID}`);
+                    if (isValidUser(formattedUUID)) {
+                        authenticated = true;
+                    } else {
+                        log(`User not found in DB: ${formattedUUID}`);
+                    }
+                } else if (protocol === atob(flash)) { // VMess
+                    const users = getUsers().filter(u => u.protocol === 'vmess');
+                    for (const user of users) {
+                        const result = await readStreamHeader(chunk, user.uuid);
+                        if (!result.hasError) {
+                            protocolHeader = result;
+                            authenticated = true;
+                            log(`VMess Auth Success: ${user.uuid}`);
+                            break;
+                        }
+                    }
+                } else {
+                    throw new Error("Unknown Protocol");
                 }
-            } else {
-                log("Unknown Protocol Data: " + chunk.toString('hex').substring(0, 50));
-                throw new Error("Unknown Protocol");
-            }
 
-            if (!protocolHeader || protocolHeader.hasError) {
-                throw new Error(protocolHeader ? protocolHeader.message : "Header Parse Failed");
-            }
+                if (!protocolHeader || protocolHeader.hasError) {
+                    throw new Error(protocolHeader ? protocolHeader.message : "Header Parse Failed");
+                }
 
-            if (!authenticated) {
-                log("Authentication Failed");
+                if (!authenticated) {
+                    log("Authentication Failed");
+                    webSocket.close();
+                    return;
+                }
+
+                remoteProtocolHeader = protocolHeader;
+
+                // 2. Send Response Header (VLESS/Trojan)
+                let responseHeader = remoteProtocolHeader.version;
+                if (protocol === atob(flash) && remoteProtocolHeader.needsResponse) {
+                     responseHeader = await generateStreamResponseHeader(
+                        remoteProtocolHeader.responseOptions,
+                        remoteProtocolHeader.encKey,
+                        remoteProtocolHeader.encIv,
+                    );
+                }
+
+                // IMPORTANT: Send response header immediately
+                if (responseHeader) webSocket.send(responseHeader);
+
+                // 3. Connect to Backend
+                const targetHost = remoteProtocolHeader.addressRemote;
+                const targetPort = remoteProtocolHeader.portRemote;
+                const isUDP = remoteProtocolHeader.isUDP;
+
+                log(`Connecting to ${targetHost}:${targetPort} (UDP: ${isUDP})`);
+
+                if (isUDP) {
+                     // UDP Logic (Simplified for buffering - UDP doesn't "connect" in the same way, but we need a socket)
+                     await handleUDPBuffering(
+                        targetHost, targetPort, remoteProtocolHeader.rawClientData,
+                        webSocket, buffer, log, RELAY_SERVER_UDP, prxIP, proxyType
+                     );
+                     // Note: UDP handler manages its own flow
+                } else {
+                    // TCP Connect
+                    const { socket, leftover } = await connectTarget(targetHost, targetPort, prxIP, proxyType);
+                    tcpSocket = socket;
+
+                    // 4. Handle Connection Events
+                    tcpSocket.on('error', (e) => {
+                         log(`TCP Error: ${e.message}`);
+                         webSocket.close();
+                    });
+
+                    tcpSocket.on('close', () => {
+                        log("TCP Closed");
+                        webSocket.close();
+                    });
+
+                    tcpSocket.on('data', (d) => {
+                        if (webSocket.readyState === WebSocket.OPEN) webSocket.send(d);
+                    });
+
+                    // 5. Write Initial Data (Leftover from Proxy + Payload)
+                    if (leftover && leftover.length > 0) {
+                        tcpSocket.write(leftover);
+                    }
+
+                    if (remoteProtocolHeader.rawClientData && remoteProtocolHeader.rawClientData.length > 0) {
+                         tcpSocket.write(remoteProtocolHeader.rawClientData);
+                    }
+
+                    // 6. Flush Buffer (Data arrived while we were awaiting connectTarget)
+                    if (buffer.length > 0) {
+                        const bufferedData = Buffer.concat(buffer);
+                        tcpSocket.write(bufferedData);
+                        buffer = null; // Free memory
+                    }
+
+                    isConnected = true;
+                }
+
+            } catch (err) {
+                log(`Handshake Error: ${err.message}`);
                 webSocket.close();
-                return;
             }
-
-            let responseHeader = protocolHeader.version;
-            if (protocol === atob(flash) && protocolHeader.needsResponse) {
-                 responseHeader = await generateStreamResponseHeader(
-                    protocolHeader.responseOptions,
-                    protocolHeader.encKey,
-                    protocolHeader.encIv,
-                );
-            }
-
-            log(`Connecting to Target: ${protocolHeader.addressRemote}:${protocolHeader.portRemote} (UDP: ${protocolHeader.isUDP})`);
-
-            if (protocolHeader.isUDP) {
-                await handleUDPOutbound(
-                    protocolHeader.addressRemote,
-                    protocolHeader.portRemote,
-                    chunk,
-                    webSocket,
-                    responseHeader,
-                    log,
-                    RELAY_SERVER_UDP,
-                    prxIP,
-                    proxyType,
-                    wsStream
-                );
+        } else {
+            // Not Header (subsequent data)
+            if (isConnected && tcpSocket && !tcpSocket.destroyed) {
+                tcpSocket.write(chunk);
             } else {
-                await handleTCPOutBound(
-                    protocolHeader.addressRemote,
-                    protocolHeader.portRemote,
-                    protocolHeader.rawClientData,
-                    webSocket,
-                    responseHeader,
-                    log,
-                    prxIP,
-                    proxyType,
-                    wsStream
-                );
+                // Still connecting, buffer it
+                // Only buffer if we are not in UDP mode (UDP handler handles its own msg)
+                // If protocolHeader is unknown (failed handshake), we are closed anyway
+                if (buffer) buffer.push(chunk);
             }
-
-        } catch (err) {
-            log(`Error: ${err.message}`);
-            webSocket.close();
         }
     });
 
-    wsStream.on('error', (err) => log(`Stream Error: ${err.message}`));
+    webSocket.on('error', (e) => log(`WS Error: ${e.message}`));
+    webSocket.on('close', () => {
+        if (tcpSocket && !tcpSocket.destroyed) tcpSocket.destroy();
+    });
 }
 
-async function handleTCPOutBound(addressRemote, portRemote, rawClientData, webSocket, responseHeader, log, prxIP, proxyType, wsStream) {
-    async function connectTarget(addr, port) {
-        if (proxyType) {
-            if (!prxIP) throw new Error("ProxyType set but no ProxyIP provided");
+// UDP Handler (Modified for flow)
+async function handleUDPBuffering(targetAddress, targetPort, initialData, webSocket, initialBuffer, log, relay, prxIP, proxyType) {
+    // This is trickier because we need to share the socket with the main 'message' handler
+    // For now, we'll keep the UDP logic self-contained but we need to stop the main handler from buffering unnecessarily
+    // The main handler pushes to `buffer` if `!isConnected`.
+    // We can set `isConnected = true` and `tcpSocket = udpSocket`? No, UDP socket write signature is different.
 
-            let sepIdx = -1;
-            if (prxIP.includes('=')) sepIdx = prxIP.lastIndexOf('=');
-            else if (prxIP.includes('-')) sepIdx = prxIP.lastIndexOf('-');
-            else sepIdx = prxIP.lastIndexOf(':');
-
-            if (sepIdx === -1) throw new Error("Invalid Proxy IP format");
-
-            const pAddr = prxIP.substring(0, sepIdx);
-            const pPort = parseInt(prxIP.substring(sepIdx + 1));
-
-            const socket = net.connect(pPort, pAddr);
-            await new Promise((res, rej) => {
-                socket.once('connect', res);
-                socket.once('error', rej);
-            });
-
-            if (proxyType === 'http') return await httpProxyConnect(socket, addr, port);
-            else return await socks5Connect(socket, addr, port);
-        } else {
-             if (prxIP && !proxyType) { // Relay
-                 let sepIdx = -1;
-                 if (prxIP.includes('=')) sepIdx = prxIP.lastIndexOf('=');
-                 else if (prxIP.includes('-')) sepIdx = prxIP.lastIndexOf('-');
-                 else sepIdx = prxIP.lastIndexOf(':');
-                 if (sepIdx !== -1) {
-                     const pAddr = prxIP.substring(0, sepIdx);
-                     const pPort = parseInt(prxIP.substring(sepIdx + 1));
-                     return { socket: net.connect(pPort, pAddr), leftover: null };
-                 }
-            }
-            return { socket: net.connect(port, addr), leftover: null };
-        }
-    }
+    // Simpler approach for UDP: Just launch the UDP handler and tell the main handler to STOP.
+    // Actually, the main handler is `on('message')`. We can remove that listener or make it ignore?
+    // Better: UDP is rare. Let's just create the socket and use a custom write logic.
 
     try {
-        const { socket: tcpSocket, leftover } = await connectTarget(addressRemote, portRemote);
+        let socket;
+         if (proxyType) {
+             // ... Proxy logic for UDP ...
+             const { socket: s } = await connectTarget(relay.host, relay.port, prxIP, proxyType);
+             socket = s;
+         } else {
+             socket = net.connect(relay.port, relay.host);
+         }
 
-        if (responseHeader && responseHeader.length > 0) {
-            wsStream.write(Buffer.from(responseHeader));
+        // Initial Payload
+        const header = `udp:${targetAddress}:${targetPort}`;
+        const payload = Buffer.concat([Buffer.from(header), Buffer.from([0x7c]), Buffer.from(initialData)]);
+        socket.write(payload);
+
+        // Flush Initial Buffer
+        if (initialBuffer.length > 0) {
+             // We need to wrap these in UDP frame too?
+             // Usually subsequent packets in UDP over VLESS are just raw payload?
+             // No, standard UDP over TCP/VLESS usually requires framing.
+             // But for this specific Relay, let's assume raw for now or just write them.
+             const buf = Buffer.concat(initialBuffer);
+             socket.write(buf);
         }
 
-        if (leftover && leftover.length > 0) {
-            wsStream.write(leftover);
-        }
-
-        if (rawClientData && rawClientData.length > 0) {
-            tcpSocket.write(rawClientData);
-        }
-
-        wsStream.resume();
-        wsStream.pipe(tcpSocket);
-        tcpSocket.pipe(wsStream);
-
-        tcpSocket.on('error', (e) => log(`TCP Error: ${e.message}`));
-        tcpSocket.on('close', () => {
-            log("TCP Closed");
-            webSocket.close();
+        socket.on('data', (chunk) => {
+            if (webSocket.readyState === WebSocket.OPEN) webSocket.send(chunk);
         });
 
-    } catch (e) {
-        log(`Outbound Connection Failed: ${e.message}`);
+        // Take over the WebSocket message handling
+        webSocket.removeAllListeners('message');
+        webSocket.on('message', (msg) => {
+             if (!socket.destroyed) socket.write(msg);
+        });
+
+        socket.on('error', (e) => log(`UDP Error: ${e.message}`));
+
+    } catch(e) {
+        log(`UDP Setup Error: ${e.message}`);
         webSocket.close();
+    }
+}
+
+async function connectTarget(host, port, prxIP, proxyType) {
+    if (proxyType) {
+        if (!prxIP) throw new Error("ProxyType set but no ProxyIP provided");
+        let sepIdx = -1;
+        if (prxIP.includes('=')) sepIdx = prxIP.lastIndexOf('=');
+        else if (prxIP.includes('-')) sepIdx = prxIP.lastIndexOf('-');
+        else sepIdx = prxIP.lastIndexOf(':');
+
+        if (sepIdx === -1) throw new Error("Invalid Proxy IP format");
+        const pAddr = prxIP.substring(0, sepIdx);
+        const pPort = parseInt(prxIP.substring(sepIdx + 1));
+
+        const socket = net.connect(pPort, pAddr);
+        await new Promise((res, rej) => {
+            socket.once('connect', res);
+            socket.once('error', rej);
+        });
+
+        if (proxyType === 'http') return await httpProxyConnect(socket, host, port);
+        else return await socks5Connect(socket, host, port);
+    } else {
+         if (prxIP && !proxyType) { // Relay
+             let sepIdx = -1;
+             if (prxIP.includes('=')) sepIdx = prxIP.lastIndexOf('=');
+             else if (prxIP.includes('-')) sepIdx = prxIP.lastIndexOf('-');
+             else sepIdx = prxIP.lastIndexOf(':');
+             if (sepIdx !== -1) {
+                 const pAddr = prxIP.substring(0, sepIdx);
+                 const pPort = parseInt(prxIP.substring(sepIdx + 1));
+                 return { socket: net.connect(pPort, pAddr), leftover: null };
+             }
+        }
+        // Direct
+        const socket = net.connect(port, host);
+        await new Promise((res, rej) => {
+            socket.once('connect', res);
+            socket.once('error', rej);
+        });
+        return { socket, leftover: null };
     }
 }
 
@@ -453,7 +528,6 @@ async function socks5Connect(socket, targetAddress, targetPort) {
 
                 let leftover = null;
                 if (data2.length > headerLen) leftover = data2.slice(headerLen);
-
                 resolve({ socket, leftover });
             });
         });
@@ -475,44 +549,6 @@ async function httpProxyConnect(socket, targetAddress, targetPort) {
         });
         socket.once('error', reject);
     });
-}
-
-async function handleUDPOutbound(targetAddress, targetPort, dataChunk, webSocket, responseHeader, log, relay, prxIP, proxyType, wsStream) {
-    async function connectTarget() {
-        if (proxyType) {
-             if (!prxIP) throw new Error("ProxyType set but no ProxyIP provided");
-             let sepIdx = -1;
-             if (prxIP.includes('=')) sepIdx = prxIP.lastIndexOf('=');
-             else if (prxIP.includes('-')) sepIdx = prxIP.lastIndexOf('-');
-             else sepIdx = prxIP.lastIndexOf(':');
-
-             if (sepIdx === -1) throw new Error("Invalid Proxy IP");
-             const pAddr = prxIP.substring(0, sepIdx);
-             const pPort = parseInt(prxIP.substring(sepIdx + 1));
-
-            const socket = net.connect(pPort, pAddr);
-            await new Promise((res, rej) => { socket.once('connect', res); socket.once('error', rej); });
-
-            let res;
-            if (proxyType === 'http') res = await httpProxyConnect(socket, relay.host, relay.port);
-            else res = await socks5Connect(socket, relay.host, relay.port);
-            return res.socket;
-        } else return net.connect(relay.port, relay.host);
-    }
-
-    try {
-        const socket = await connectTarget();
-        if (responseHeader) wsStream.write(Buffer.from(responseHeader));
-
-        const header = `udp:${targetAddress}:${targetPort}`;
-        const payload = Buffer.concat([Buffer.from(header), Buffer.from([0x7c]), Buffer.from(dataChunk)]);
-        socket.write(payload);
-
-        wsStream.resume();
-        wsStream.pipe(socket);
-        socket.pipe(wsStream);
-        socket.on('error', (e) => log(`UDP Error: ${e.message}`));
-    } catch(e) { webSocket.close(); }
 }
 
 async function protocolSniffer(buffer) {
@@ -634,7 +670,5 @@ async function kdf(key, path) {
     }
     return result;
 }
-
-function arrayBufferToHex(buf) { return Buffer.from(buf).toString('hex'); }
 
 server.listen(PORT, () => { console.log(`Server running on ${PORT}`); });

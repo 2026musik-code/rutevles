@@ -194,7 +194,6 @@ const server = http.createServer(async (req, res) => {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         exec('git pull origin main', { cwd: __dirname }, (err, stdout, stderr) => {
             if (err) {
-                console.error(err);
                 res.end(JSON.stringify({ success: false, message: stderr }));
                 return;
             }
@@ -314,175 +313,225 @@ server.on('upgrade', async (request, socket, head) => {
 });
 
 async function websocketHandler(webSocket, request, prxIP, proxyType) {
-    const wsStream = WebSocket.createWebSocketStream(webSocket);
     const log = (msg) => console.log(`[WS] ${msg}`);
 
-    wsStream.once('data', async (chunk) => {
-        wsStream.pause();
+    let isHeader = true;
+    let isConnected = false;
+    let buffer = []; // Buffer for chunks arriving during connect
+    let tcpSocket = null;
+    let remoteProtocolHeader = null;
 
-        try {
-            const protocol = await protocolSniffer(chunk);
-            let protocolHeader;
-            let uuid = "";
-            let authenticated = false;
+    webSocket.on('message', async (chunk) => {
+        if (isHeader) {
+            isHeader = false; // Only try to parse the first chunk as header
 
-            log(`Sniffed Protocol: ${protocol}`);
+            try {
+                // 1. Sniff & Parse
+                const protocol = await protocolSniffer(chunk);
+                let protocolHeader;
+                let authenticated = false;
 
-            if (protocol === atob(horse)) { // Trojan
-                protocolHeader = readHorseHeader(chunk);
-                if (!protocolHeader.hasError && isValidTrojanUser(protocolHeader.passwordHash)) {
-                    authenticated = true;
-                }
-            } else if (protocol === atob(neko)) { // VLESS
-                protocolHeader = readNekoHeader(chunk);
-                uuid = arrayBufferToHex(chunk.slice(1, 17));
-                const formattedUUID = `${uuid.substr(0,8)}-${uuid.substr(8,4)}-${uuid.substr(12,4)}-${uuid.substr(16,4)}-${uuid.substr(20,12)}`;
-                log(`VLESS UUID: ${formattedUUID}`);
-                if (isValidUser(formattedUUID)) {
-                    authenticated = true;
-                } else {
-                    log(`User not found in DB: ${formattedUUID}`);
-                }
-            } else if (protocol === atob(flash)) { // VMess
-                const users = getUsers().filter(u => u.protocol === 'vmess');
-                for (const user of users) {
-                    const result = await readStreamHeader(chunk, user.uuid);
-                    if (!result.hasError) {
-                        protocolHeader = result;
+                log(`Sniffed Protocol: ${protocol}`);
+
+                if (protocol === atob(horse)) { // Trojan
+                    protocolHeader = readHorseHeader(chunk);
+                    if (!protocolHeader.hasError && isValidTrojanUser(protocolHeader.passwordHash)) {
                         authenticated = true;
-                        log(`VMess Auth Success: ${user.uuid}`);
-                        break;
                     }
+                } else if (protocol === atob(neko)) { // VLESS
+                    protocolHeader = readNekoHeader(chunk);
+                    const uuid = arrayBufferToHex(chunk.slice(1, 17));
+                    const formattedUUID = `${uuid.substr(0,8)}-${uuid.substr(8,4)}-${uuid.substr(12,4)}-${uuid.substr(16,4)}-${uuid.substr(20,12)}`;
+                    log(`VLESS UUID: ${formattedUUID}`);
+                    if (isValidUser(formattedUUID)) {
+                        authenticated = true;
+                    } else {
+                        log(`User not found in DB: ${formattedUUID}`);
+                    }
+                } else if (protocol === atob(flash)) { // VMess
+                    const users = getUsers().filter(u => u.protocol === 'vmess');
+                    for (const user of users) {
+                        const result = await readStreamHeader(chunk, user.uuid);
+                        if (!result.hasError) {
+                            protocolHeader = result;
+                            authenticated = true;
+                            log(`VMess Auth Success: ${user.uuid}`);
+                            break;
+                        }
+                    }
+                } else {
+                    throw new Error("Unknown Protocol");
                 }
-            } else {
-                log("Unknown Protocol Data: " + chunk.toString('hex').substring(0, 50));
-                throw new Error("Unknown Protocol");
-            }
 
-            if (!protocolHeader || protocolHeader.hasError) {
-                throw new Error(protocolHeader ? protocolHeader.message : "Header Parse Failed");
-            }
+                if (!protocolHeader || protocolHeader.hasError) {
+                    throw new Error(protocolHeader ? protocolHeader.message : "Header Parse Failed");
+                }
 
-            if (!authenticated) {
-                log("Authentication Failed");
+                if (!authenticated) {
+                    log("Authentication Failed");
+                    webSocket.close();
+                    return;
+                }
+
+                remoteProtocolHeader = protocolHeader;
+
+                // 2. Send Response Header (VLESS/Trojan)
+                let responseHeader = remoteProtocolHeader.version;
+                if (protocol === atob(flash) && remoteProtocolHeader.needsResponse) {
+                     responseHeader = await generateStreamResponseHeader(
+                        remoteProtocolHeader.responseOptions,
+                        remoteProtocolHeader.encKey,
+                        remoteProtocolHeader.encIv,
+                    );
+                }
+
+                if (responseHeader) webSocket.send(responseHeader);
+
+                // 3. Connect to Backend
+                const targetHost = remoteProtocolHeader.addressRemote;
+                const targetPort = remoteProtocolHeader.portRemote;
+                const isUDP = remoteProtocolHeader.isUDP;
+
+                log(`Connecting to ${targetHost}:${targetPort} (UDP: ${isUDP})`);
+
+                if (isUDP) {
+                     await handleUDPBuffering(
+                        targetHost, targetPort, remoteProtocolHeader.rawClientData,
+                        webSocket, buffer, log, RELAY_SERVER_UDP, prxIP, proxyType
+                     );
+                } else {
+                    // TCP Connect
+                    const { socket, leftover } = await connectTarget(targetHost, targetPort, prxIP, proxyType);
+                    tcpSocket = socket;
+
+                    // 4. Handle Connection Events
+                    tcpSocket.on('error', (e) => {
+                         log(`TCP Error: ${e.message}`);
+                         webSocket.close();
+                    });
+
+                    tcpSocket.on('close', () => {
+                        log("TCP Closed");
+                        webSocket.close();
+                    });
+
+                    tcpSocket.on('data', (d) => {
+                        if (webSocket.readyState === WebSocket.OPEN) webSocket.send(d);
+                    });
+
+                    // 5. Write Initial Data
+                    if (leftover && leftover.length > 0) {
+                        tcpSocket.write(leftover);
+                    }
+
+                    if (remoteProtocolHeader.rawClientData && remoteProtocolHeader.rawClientData.length > 0) {
+                         tcpSocket.write(remoteProtocolHeader.rawClientData);
+                    }
+
+                    // 6. Flush Buffer
+                    if (buffer.length > 0) {
+                        const bufferedData = Buffer.concat(buffer);
+                        tcpSocket.write(bufferedData);
+                        buffer = null;
+                    }
+
+                    isConnected = true;
+                }
+
+            } catch (err) {
+                log(`Handshake Error: ${err.message}`);
                 webSocket.close();
-                return;
             }
-
-            let responseHeader = protocolHeader.version;
-            if (protocol === atob(flash) && protocolHeader.needsResponse) {
-                 responseHeader = await generateStreamResponseHeader(
-                    protocolHeader.responseOptions,
-                    protocolHeader.encKey,
-                    protocolHeader.encIv,
-                );
-            }
-
-            log(`Connecting to Target: ${protocolHeader.addressRemote}:${protocolHeader.portRemote} (UDP: ${protocolHeader.isUDP})`);
-
-            if (protocolHeader.isUDP) {
-                await handleUDPOutbound(
-                    protocolHeader.addressRemote,
-                    protocolHeader.portRemote,
-                    chunk,
-                    webSocket,
-                    responseHeader,
-                    log,
-                    RELAY_SERVER_UDP,
-                    prxIP,
-                    proxyType,
-                    wsStream
-                );
+        } else {
+            // Not Header
+            if (isConnected && tcpSocket && !tcpSocket.destroyed) {
+                tcpSocket.write(chunk);
             } else {
-                await handleTCPOutBound(
-                    protocolHeader.addressRemote,
-                    protocolHeader.portRemote,
-                    protocolHeader.rawClientData,
-                    webSocket,
-                    responseHeader,
-                    log,
-                    prxIP,
-                    proxyType,
-                    wsStream
-                );
+                if (buffer) buffer.push(chunk);
             }
-
-        } catch (err) {
-            log(`Error: ${err.message}`);
-            webSocket.close();
         }
     });
 
-    wsStream.on('error', (err) => log(`Stream Error: ${err.message}`));
+    webSocket.on('error', (e) => log(`WS Error: ${e.message}`));
+    webSocket.on('close', () => {
+        if (tcpSocket && !tcpSocket.destroyed) tcpSocket.destroy();
+    });
 }
 
-async function handleTCPOutBound(addressRemote, portRemote, rawClientData, webSocket, responseHeader, log, prxIP, proxyType, wsStream) {
-    async function connectTarget(addr, port) {
-        if (proxyType) {
-            if (!prxIP) throw new Error("ProxyType set but no ProxyIP provided");
-
-            let sepIdx = -1;
-            if (prxIP.includes('=')) sepIdx = prxIP.lastIndexOf('=');
-            else if (prxIP.includes('-')) sepIdx = prxIP.lastIndexOf('-');
-            else sepIdx = prxIP.lastIndexOf(':');
-
-            if (sepIdx === -1) throw new Error("Invalid Proxy IP format");
-
-            const pAddr = prxIP.substring(0, sepIdx);
-            const pPort = parseInt(prxIP.substring(sepIdx + 1));
-
-            const socket = net.connect(pPort, pAddr);
-            await new Promise((res, rej) => {
-                socket.once('connect', res);
-                socket.once('error', rej);
-            });
-
-            if (proxyType === 'http') return await httpProxyConnect(socket, addr, port);
-            else return await socks5Connect(socket, addr, port);
-        } else {
-             if (prxIP && !proxyType) { // Relay
-                 let sepIdx = -1;
-                 if (prxIP.includes('=')) sepIdx = prxIP.lastIndexOf('=');
-                 else if (prxIP.includes('-')) sepIdx = prxIP.lastIndexOf('-');
-                 else sepIdx = prxIP.lastIndexOf(':');
-                 if (sepIdx !== -1) {
-                     const pAddr = prxIP.substring(0, sepIdx);
-                     const pPort = parseInt(prxIP.substring(sepIdx + 1));
-                     return { socket: net.connect(pPort, pAddr), leftover: null };
-                 }
-            }
-            return { socket: net.connect(port, addr), leftover: null };
-        }
-    }
-
+async function handleUDPBuffering(targetAddress, targetPort, initialData, webSocket, initialBuffer, log, relay, prxIP, proxyType) {
     try {
-        const { socket: tcpSocket, leftover } = await connectTarget(addressRemote, portRemote);
+        let socket;
+         if (proxyType) {
+             const { socket: s } = await connectTarget(relay.host, relay.port, prxIP, proxyType);
+             socket = s;
+         } else {
+             socket = net.connect(relay.port, relay.host);
+         }
 
-        if (responseHeader && responseHeader.length > 0) {
-            wsStream.write(Buffer.from(responseHeader));
+        const header = `udp:${targetAddress}:${targetPort}`;
+        const payload = Buffer.concat([Buffer.from(header), Buffer.from([0x7c]), Buffer.from(initialData)]);
+        socket.write(payload);
+
+        if (initialBuffer.length > 0) {
+             const buf = Buffer.concat(initialBuffer);
+             socket.write(buf);
         }
 
-        if (leftover && leftover.length > 0) {
-            wsStream.write(leftover);
-        }
-
-        if (rawClientData && rawClientData.length > 0) {
-            tcpSocket.write(rawClientData);
-        }
-
-        wsStream.resume();
-        wsStream.pipe(tcpSocket);
-        tcpSocket.pipe(wsStream);
-
-        tcpSocket.on('error', (e) => log(`TCP Error: ${e.message}`));
-        tcpSocket.on('close', () => {
-            log("TCP Closed");
-            webSocket.close();
+        socket.on('data', (chunk) => {
+            if (webSocket.readyState === WebSocket.OPEN) webSocket.send(chunk);
         });
 
-    } catch (e) {
-        log(`Outbound Connection Failed: ${e.message}`);
+        webSocket.removeAllListeners('message');
+        webSocket.on('message', (msg) => {
+             if (!socket.destroyed) socket.write(msg);
+        });
+
+        socket.on('error', (e) => log(`UDP Error: ${e.message}`));
+
+    } catch(e) {
+        log(`UDP Setup Error: ${e.message}`);
         webSocket.close();
+    }
+}
+
+async function connectTarget(host, port, prxIP, proxyType) {
+    if (proxyType) {
+        if (!prxIP) throw new Error("ProxyType set but no ProxyIP provided");
+        let sepIdx = -1;
+        if (prxIP.includes('=')) sepIdx = prxIP.lastIndexOf('=');
+        else if (prxIP.includes('-')) sepIdx = prxIP.lastIndexOf('-');
+        else sepIdx = prxIP.lastIndexOf(':');
+
+        if (sepIdx === -1) throw new Error("Invalid Proxy IP format");
+        const pAddr = prxIP.substring(0, sepIdx);
+        const pPort = parseInt(prxIP.substring(sepIdx + 1));
+
+        const socket = net.connect(pPort, pAddr);
+        await new Promise((res, rej) => {
+            socket.once('connect', res);
+            socket.once('error', rej);
+        });
+
+        if (proxyType === 'http') return await httpProxyConnect(socket, host, port);
+        else return await socks5Connect(socket, host, port);
+    } else {
+         if (prxIP && !proxyType) { // Relay
+             let sepIdx = -1;
+             if (prxIP.includes('=')) sepIdx = prxIP.lastIndexOf('=');
+             else if (prxIP.includes('-')) sepIdx = prxIP.lastIndexOf('-');
+             else sepIdx = prxIP.lastIndexOf(':');
+             if (sepIdx !== -1) {
+                 const pAddr = prxIP.substring(0, sepIdx);
+                 const pPort = parseInt(prxIP.substring(sepIdx + 1));
+                 return { socket: net.connect(pPort, pAddr), leftover: null };
+             }
+        }
+        const socket = net.connect(port, host);
+        await new Promise((res, rej) => {
+            socket.once('connect', res);
+            socket.once('error', rej);
+        });
+        return { socket, leftover: null };
     }
 }
 
@@ -540,44 +589,6 @@ async function httpProxyConnect(socket, targetAddress, targetPort) {
         });
         socket.once('error', reject);
     });
-}
-
-async function handleUDPOutbound(targetAddress, targetPort, dataChunk, webSocket, responseHeader, log, relay, prxIP, proxyType, wsStream) {
-    async function connectTarget() {
-        if (proxyType) {
-             if (!prxIP) throw new Error("ProxyType set but no ProxyIP provided");
-             let sepIdx = -1;
-             if (prxIP.includes('=')) sepIdx = prxIP.lastIndexOf('=');
-             else if (prxIP.includes('-')) sepIdx = prxIP.lastIndexOf('-');
-             else sepIdx = prxIP.lastIndexOf(':');
-
-             if (sepIdx === -1) throw new Error("Invalid Proxy IP");
-             const pAddr = prxIP.substring(0, sepIdx);
-             const pPort = parseInt(prxIP.substring(sepIdx + 1));
-
-            const socket = net.connect(pPort, pAddr);
-            await new Promise((res, rej) => { socket.once('connect', res); socket.once('error', rej); });
-
-            let res;
-            if (proxyType === 'http') res = await httpProxyConnect(socket, relay.host, relay.port);
-            else res = await socks5Connect(socket, relay.host, relay.port);
-            return res.socket;
-        } else return net.connect(relay.port, relay.host);
-    }
-
-    try {
-        const socket = await connectTarget();
-        if (responseHeader) wsStream.write(Buffer.from(responseHeader));
-
-        const header = `udp:${targetAddress}:${targetPort}`;
-        const payload = Buffer.concat([Buffer.from(header), Buffer.from([0x7c]), Buffer.from(dataChunk)]);
-        socket.write(payload);
-
-        wsStream.resume();
-        wsStream.pipe(socket);
-        socket.pipe(wsStream);
-        socket.on('error', (e) => log(`UDP Error: ${e.message}`));
-    } catch(e) { webSocket.close(); }
 }
 
 async function protocolSniffer(buffer) {
@@ -703,6 +714,600 @@ async function kdf(key, path) {
 function arrayBufferToHex(buf) { return Buffer.from(buf).toString('hex'); }
 
 server.listen(PORT, () => { console.log(`Server running on ${PORT}`); });
+EOF
+
+# Generate Dashboard HTML
+cat <<'EOF' > $INSTALL_DIR/public/index.html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RUTE PREMIUM | VPS Manager</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <style>
+        :root {
+            --bg-body: #0f172a;
+            --bg-panel: #1e293b;
+            --bg-input: #334155;
+            --text-main: #f8fafc;
+            --text-muted: #94a3b8;
+            --primary: #3b82f6;
+            --primary-hover: #2563eb;
+            --danger: #ef4444;
+            --success: #10b981;
+            --warning: #f59e0b;
+            --border: #334155;
+        }
+
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: var(--bg-body);
+            color: var(--text-main);
+            min-height: 100vh;
+            display: flex;
+        }
+
+        /* Sidebar */
+        .sidebar {
+            width: 250px;
+            background-color: var(--bg-panel);
+            border-right: 1px solid var(--border);
+            display: flex;
+            flex-direction: column;
+            position: fixed;
+            height: 100%;
+            left: 0;
+            top: 0;
+            z-index: 50;
+            transition: transform 0.3s ease;
+        }
+
+        .brand {
+            padding: 24px;
+            font-size: 1.5rem;
+            font-weight: 700;
+            color: var(--primary);
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .nav-links {
+            flex: 1;
+            padding: 0 16px;
+        }
+
+        .nav-link {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            padding: 12px 16px;
+            color: var(--text-muted);
+            text-decoration: none;
+            border-radius: 8px;
+            margin-bottom: 4px;
+            transition: all 0.2s;
+        }
+
+        .nav-link:hover, .nav-link.active {
+            background-color: rgba(59, 130, 246, 0.1);
+            color: var(--primary);
+        }
+
+        .nav-link i { width: 20px; text-align: center; }
+
+        /* Main Content */
+        .main {
+            flex: 1;
+            margin-left: 250px;
+            padding: 32px;
+            width: 100%;
+        }
+
+        /* Header */
+        .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 32px;
+        }
+
+        .title h1 { font-size: 1.5rem; font-weight: 600; }
+        .title p { color: var(--text-muted); font-size: 0.9rem; margin-top: 4px; }
+
+        .header-actions { display: flex; gap: 16px; }
+
+        .btn {
+            padding: 10px 20px;
+            border-radius: 8px;
+            border: none;
+            font-weight: 500;
+            cursor: pointer;
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            font-family: inherit;
+            transition: 0.2s;
+        }
+
+        .btn-primary { background-color: var(--primary); color: white; }
+        .btn-primary:hover { background-color: var(--primary-hover); }
+        .btn-danger { background-color: rgba(239, 68, 68, 0.1); color: var(--danger); }
+        .btn-danger:hover { background-color: rgba(239, 68, 68, 0.2); }
+        .btn-success { background-color: var(--success); color: white; }
+        .btn-success:hover { background-color: #059669; }
+        .btn-sm { padding: 6px 12px; font-size: 0.85rem; }
+
+        /* Stats Grid */
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+            gap: 24px;
+            margin-bottom: 32px;
+        }
+
+        .stat-card {
+            background-color: var(--bg-panel);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 24px;
+        }
+
+        .stat-label { color: var(--text-muted); font-size: 0.9rem; margin-bottom: 8px; }
+        .stat-value { font-size: 2rem; font-weight: 700; color: white; }
+
+        /* Table */
+        .table-container {
+            background-color: var(--bg-panel);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            overflow: hidden;
+        }
+
+        .table-header {
+            padding: 20px;
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .search-box {
+            position: relative;
+        }
+        .search-box input {
+            background-color: var(--bg-body);
+            border: 1px solid var(--border);
+            color: white;
+            padding: 8px 12px 8px 36px;
+            border-radius: 6px;
+            outline: none;
+            width: 250px;
+        }
+        .search-box i {
+            position: absolute;
+            left: 12px;
+            top: 50%;
+            transform: translateY(-50%);
+            color: var(--text-muted);
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+
+        th {
+            text-align: left;
+            padding: 16px 24px;
+            color: var(--text-muted);
+            font-weight: 500;
+            font-size: 0.85rem;
+            border-bottom: 1px solid var(--border);
+        }
+
+        td {
+            padding: 16px 24px;
+            border-bottom: 1px solid var(--border);
+            vertical-align: middle;
+        }
+
+        tr:last-child td { border-bottom: none; }
+        tr:hover td { background-color: rgba(255,255,255,0.02); }
+
+        .badge {
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+        .badge-vless { background: rgba(16, 185, 129, 0.1); color: var(--success); }
+        .badge-vmess { background: rgba(245, 158, 11, 0.1); color: var(--warning); }
+        .badge-trojan { background: rgba(59, 130, 246, 0.1); color: var(--primary); }
+
+        /* Modal */
+        .modal-overlay {
+            position: fixed;
+            top: 0; left: 0; width: 100%; height: 100%;
+            background: rgba(0,0,0,0.5);
+            backdrop-filter: blur(4px);
+            z-index: 100;
+            display: none;
+            justify-content: center;
+            align-items: center;
+        }
+        .modal-overlay.active { display: flex; }
+
+        .modal {
+            background-color: var(--bg-panel);
+            width: 90%;
+            max-width: 500px;
+            border-radius: 16px;
+            padding: 32px;
+            border: 1px solid var(--border);
+            box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.3);
+        }
+
+        .form-group { margin-bottom: 20px; }
+        .form-group label { display: block; margin-bottom: 8px; color: var(--text-muted); font-size: 0.9rem; }
+        .form-group input, .form-group select {
+            width: 100%;
+            padding: 10px;
+            background-color: var(--bg-input);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            color: white;
+            outline: none;
+        }
+        .form-group input:focus, .form-group select:focus { border-color: var(--primary); }
+
+        /* Mobile */
+        .mobile-toggle { display: none; color: white; font-size: 1.5rem; cursor: pointer; }
+
+        @media (max-width: 768px) {
+            .sidebar { transform: translateX(-100%); }
+            .sidebar.open { transform: translateX(0); }
+            .main { margin-left: 0; padding: 20px; }
+            .mobile-toggle { display: block; margin-right: 16px; }
+            .table-container { overflow-x: auto; }
+            .header-actions { display: none; } /* Hide profile on mobile to save space */
+        }
+
+        /* Toast */
+        #toast-container { position: fixed; bottom: 24px; right: 24px; z-index: 200; }
+        .toast {
+            background: var(--bg-panel);
+            border: 1px solid var(--border);
+            padding: 16px 24px;
+            border-radius: 8px;
+            margin-top: 10px;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.3);
+            animation: slideUp 0.3s ease;
+        }
+        @keyframes slideUp { from { transform: translateY(20px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
+    </style>
+</head>
+<body>
+
+    <nav class="sidebar" id="sidebar">
+        <div class="brand">
+            <i class="fa-solid fa-bolt"></i> RUTE PREMIUM
+        </div>
+        <div class="nav-links">
+            <a href="#" class="nav-link active"><i class="fa-solid fa-grid-2"></i> Dashboard</a>
+            <a href="#" class="nav-link"><i class="fa-solid fa-users"></i> Users</a>
+            <a href="#" class="nav-link"><i class="fa-solid fa-network-wired"></i> Proxies</a>
+            <div style="margin-top: auto; padding-top: 20px; border-top: 1px solid var(--border);">
+                <a href="#" class="nav-link" onclick="updateSystem()"><i class="fa-solid fa-cloud-arrow-down"></i> Update System</a>
+                <a href="#" class="nav-link" onclick="location.reload()"><i class="fa-solid fa-rotate"></i> Refresh</a>
+            </div>
+        </div>
+    </nav>
+
+    <main class="main">
+        <div class="header">
+            <div style="display:flex; align-items:center;">
+                <div class="mobile-toggle" onclick="toggleSidebar()"><i class="fa-solid fa-bars"></i></div>
+                <div class="title">
+                    <h1>Dashboard</h1>
+                    <p>Manage your VLESS/VMess/Trojan Accounts</p>
+                </div>
+            </div>
+            <div class="header-actions">
+                <button class="btn btn-primary" onclick="openModal()">
+                    <i class="fa-solid fa-plus"></i> New User
+                </button>
+            </div>
+        </div>
+
+        <div class="stats-grid">
+            <div class="stat-card">
+                <div class="stat-label">Total Users</div>
+                <div class="stat-value" id="stat-total">0</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Active Protocols</div>
+                <div class="stat-value">3</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">System Status</div>
+                <div class="stat-value" style="color: var(--success); font-size: 1.5rem;">
+                    <i class="fa-solid fa-circle-check"></i> Online
+                </div>
+            </div>
+        </div>
+
+        <div class="table-container">
+            <div class="table-header">
+                <h3>User List</h3>
+                <div class="search-box">
+                    <i class="fa-solid fa-search"></i>
+                    <input type="text" placeholder="Search user..." id="search" onkeyup="filterUsers()">
+                </div>
+            </div>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Username</th>
+                        <th>Protocol</th>
+                        <th>UUID / Password</th>
+                        <th>Proxy Route</th>
+                        <th>Expiry</th>
+                        <th>Actions</th>
+                    </tr>
+                </thead>
+                <tbody id="user-table-body">
+                    <!-- Data Injected Here -->
+                </tbody>
+            </table>
+        </div>
+    </main>
+
+    <!-- Create Modal -->
+    <div class="modal-overlay" id="createModal">
+        <div class="modal">
+            <h2 style="margin-bottom: 24px;">Create New User</h2>
+            <form onsubmit="createUser(event)">
+                <div class="form-group">
+                    <label>Username</label>
+                    <input type="text" id="in_username" placeholder="e.g. client01" required>
+                </div>
+                <div class="form-group">
+                    <label>Protocol</label>
+                    <select id="in_protocol">
+                        <option value="vless">VLESS</option>
+                        <option value="vmess">VMESS</option>
+                        <option value="trojan">TROJAN</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>Proxy Route (Optional)</label>
+                    <div style="display: flex; gap: 10px;">
+                        <input type="text" id="in_proxy" placeholder="1.2.3.4:1080" oninput="validateProxyInput()">
+                        <select id="in_proxy_type" style="width: 100px;">
+                            <option value="socks5">SOCKS5</option>
+                            <option value="http">HTTP</option>
+                        </select>
+                    </div>
+                    <small id="proxy_hint" style="color: var(--text-muted)">Route this user's traffic through an upstream proxy.</small>
+                </div>
+                <div class="form-group">
+                    <label>Duration</label>
+                    <select id="in_days">
+                        <option value="30">30 Days</option>
+                        <option value="90">90 Days</option>
+                        <option value="365">1 Year</option>
+                    </select>
+                </div>
+                <div style="display: flex; justify-content: flex-end; gap: 12px;">
+                    <button type="button" class="btn" style="background: var(--bg-input); color: white;" onclick="closeModal()">Cancel</button>
+                    <button type="submit" class="btn btn-primary">Create</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <div id="toast-container"></div>
+
+    <script>
+        const API_URL = '/api/users';
+        let allUsers = [];
+
+        // Init
+        document.addEventListener('DOMContentLoaded', loadData);
+
+        function toggleSidebar() {
+            document.getElementById('sidebar').classList.toggle('open');
+        }
+
+        function openModal() {
+            document.getElementById('createModal').classList.add('active');
+        }
+        function closeModal() {
+            document.getElementById('createModal').classList.remove('active');
+        }
+
+        async function updateSystem() {
+            if(!confirm("Are you sure you want to update the system from GitHub? The service will restart.")) return;
+            try {
+                showToast("Updating system...", "success");
+                const res = await fetch('/api/update', { method: 'POST' });
+                const data = await res.json();
+                if(data.success) {
+                    showToast(data.message);
+                    setTimeout(() => location.reload(), 3000);
+                } else {
+                    showToast("Update failed: " + data.message, "error");
+                }
+            } catch(e) {
+                showToast("Update error: " + e.message, "error");
+            }
+        }
+
+        async function loadData() {
+            try {
+                const res = await fetch(API_URL);
+                if (res.status === 401) {
+                    window.location.href = '/login.html';
+                    return;
+                }
+                allUsers = await res.json();
+                renderTable(allUsers);
+                document.getElementById('stat-total').innerText = allUsers.length;
+            } catch(e) {
+                showToast(e.message, 'error');
+            }
+        }
+
+        function renderTable(users) {
+            const tbody = document.getElementById('user-table-body');
+            tbody.innerHTML = '';
+
+            if (users.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="6" style="text-align:center; padding: 30px;">No users found.</td></tr>';
+                return;
+            }
+
+            users.forEach(u => {
+                const tr = document.createElement('tr');
+                const expiry = new Date(u.expiredDate).toLocaleDateString();
+                const proxyDisplay = u.proxyRoute ? `<span style="font-family:monospace; font-size:0.8rem; background:var(--bg-input); padding:2px 6px; border-radius:4px;">${u.proxyRoute}</span>` : '<span style="color:var(--text-muted)">Direct</span>';
+
+                tr.innerHTML = `
+                    <td><b>${u.username}</b></td>
+                    <td><span class="badge badge-${u.protocol}">${u.protocol.toUpperCase()}</span></td>
+                    <td style="font-family: monospace; color: var(--text-muted);">${u.uuid.substring(0,8)}...</td>
+                    <td>${proxyDisplay}</td>
+                    <td>${expiry}</td>
+                    <td>
+                        <button class="btn btn-primary btn-sm" onclick="copyConfig('${u.uuid}', '${u.protocol}', '${u.username}', '${u.proxyRoute}', '${u.proxyType}')">
+                            <i class="fa-regular fa-copy"></i>
+                        </button>
+                        <button class="btn btn-danger btn-sm" onclick="deleteUser('${u.uuid}')">
+                            <i class="fa-solid fa-trash"></i>
+                        </button>
+                    </td>
+                `;
+                tbody.appendChild(tr);
+            });
+        }
+
+        function filterUsers() {
+            const term = document.getElementById('search').value.toLowerCase();
+            const filtered = allUsers.filter(u => u.username.toLowerCase().includes(term));
+            renderTable(filtered);
+        }
+
+        function validateProxyInput() {
+            const input = document.getElementById('in_proxy').value;
+            const hint = document.getElementById('proxy_hint');
+            if (input && !input.includes(':')) {
+                hint.style.color = 'var(--warning)';
+                hint.innerText = 'Warning: Port missing! Format: IP:Port (e.g. 1.2.3.4:8080)';
+                return false;
+            } else {
+                hint.style.color = 'var(--text-muted)';
+                hint.innerText = 'Route this user\'s traffic through an upstream proxy.';
+                return true;
+            }
+        }
+
+        async function createUser(e) {
+            e.preventDefault();
+            if (!validateProxyInput()) {
+                if(!confirm('Proxy IP seems to be missing a port. Are you sure?')) return;
+            }
+
+            const username = document.getElementById('in_username').value;
+            const protocol = document.getElementById('in_protocol').value;
+            const proxyRoute = document.getElementById('in_proxy').value;
+            const proxyType = document.getElementById('in_proxy_type').value;
+            const days = document.getElementById('in_days').value;
+
+            const uuid = 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+                const r = Math.random() * 16 | 0, v = c == 'x' ? r : (r & 0x3 | 0x8);
+                return v.toString(16);
+            });
+
+            const date = new Date();
+            date.setDate(date.getDate() + parseInt(days));
+
+            const payload = { username, protocol, uuid, proxyRoute, proxyType, days, expiredDate: date.toISOString() };
+
+            try {
+                const res = await fetch(API_URL, {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(payload)
+                });
+                if (res.ok) {
+                    showToast('User created successfully');
+                    closeModal();
+                    loadData();
+                    e.target.reset();
+                } else {
+                    showToast('Failed to create user', 'error');
+                }
+            } catch(e) { showToast(e.message, 'error'); }
+        }
+
+        async function deleteUser(uuid) {
+            if(!confirm('Are you sure you want to delete this user?')) return;
+            try {
+                const res = await fetch(`${API_URL}/${uuid}`, { method: 'DELETE' });
+                if (res.ok) {
+                    showToast('User deleted');
+                    loadData();
+                }
+            } catch(e) { showToast(e.message, 'error'); }
+        }
+
+        function copyConfig(uuid, protocol, username, proxyRoute, proxyType) {
+            const host = window.location.hostname;
+            const port = 443;
+            let path = '/';
+            if (proxyRoute && proxyRoute.trim()) {
+                path = `/${proxyRoute}?proxyType=${proxyType}`;
+            } else {
+                path = '/';
+            }
+
+            let link = '';
+            if (protocol === 'vless') {
+                link = `vless://${uuid}@${host}:${port}?encryption=none&security=tls&type=ws&host=${host}&path=${encodeURIComponent(path)}#${encodeURIComponent(username)}`;
+            } else if (protocol === 'vmess') {
+                const vmessJson = {
+                    v: "2", ps: username, add: host, port: port, id: uuid, aid: "0", scy: "auto", net: "ws", type: "none", host: host, path: path, tls: "tls"
+                };
+                link = `vmess://${btoa(JSON.stringify(vmessJson))}`;
+            } else if (protocol === 'trojan') {
+                link = `trojan://${uuid}@${host}:${port}?security=tls&type=ws&host=${host}&path=${encodeURIComponent(path)}#${encodeURIComponent(username)}`;
+            }
+
+            navigator.clipboard.writeText(link).then(() => showToast('Config copied to clipboard'));
+        }
+
+        function showToast(msg, type = 'success') {
+            const div = document.createElement('div');
+            div.className = 'toast';
+            div.style.borderLeft = `4px solid ${type === 'success' ? 'var(--success)' : 'var(--danger)'}`;
+            div.innerHTML = `<span>${msg}</span>`;
+            document.getElementById('toast-container').appendChild(div);
+            setTimeout(() => div.remove(), 3000);
+        }
+    </script>
+</body>
+</html>
 EOF
 
 # Generate Login HTML (reusing previous correct version)

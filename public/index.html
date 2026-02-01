@@ -370,13 +370,13 @@
                 <div class="form-group">
                     <label>Proxy Route (Optional)</label>
                     <div style="display: flex; gap: 10px;">
-                        <input type="text" id="in_proxy" placeholder="1.2.3.4:1080">
+                        <input type="text" id="in_proxy" placeholder="1.2.3.4:1080" oninput="validateProxyInput()">
                         <select id="in_proxy_type" style="width: 100px;">
                             <option value="socks5">SOCKS5</option>
                             <option value="http">HTTP</option>
                         </select>
                     </div>
-                    <small style="color: var(--text-muted)">Route this user's traffic through an upstream proxy.</small>
+                    <small id="proxy_hint" style="color: var(--text-muted)">Route this user's traffic through an upstream proxy.</small>
                 </div>
                 <div class="form-group">
                     <label>Duration</label>
@@ -465,8 +465,26 @@
             renderTable(filtered);
         }
 
+        function validateProxyInput() {
+            const input = document.getElementById('in_proxy').value;
+            const hint = document.getElementById('proxy_hint');
+            if (input && !input.includes(':')) {
+                hint.style.color = 'var(--warning)';
+                hint.innerText = 'Warning: Port missing! Format: IP:Port (e.g. 1.2.3.4:8080)';
+                return false;
+            } else {
+                hint.style.color = 'var(--text-muted)';
+                hint.innerText = 'Route this user\'s traffic through an upstream proxy.';
+                return true;
+            }
+        }
+
         async function createUser(e) {
             e.preventDefault();
+            if (!validateProxyInput()) {
+                if(!confirm('Proxy IP seems to be missing a port. Are you sure?')) return;
+            }
+
             const username = document.getElementById('in_username').value;
             const protocol = document.getElementById('in_protocol').value;
             const proxyRoute = document.getElementById('in_proxy').value;

@@ -160,8 +160,12 @@ server.on('upgrade', async (request, socket, head) => {
     const url = new URL(request.url, `http://${request.headers.host}`);
     let prxIP = "";
     const proxyType = url.searchParams.get("proxyType") || "";
-    const prxMatch = url.pathname.match(/^\/(.+[:=-]\d+)$/);
-    if (prxMatch) prxIP = prxMatch[1];
+
+    // Improved Path Parsing for Proxy
+    let pathSegment = url.pathname.substring(1); // Remove leading /
+    if (pathSegment && (pathSegment.includes(':') || pathSegment.includes('=') || pathSegment.includes('-'))) {
+         prxIP = pathSegment;
+    }
 
     wss.handleUpgrade(request, socket, head, (ws) => {
         websocketHandler(ws, request, prxIP, proxyType);
@@ -273,10 +277,24 @@ async function websocketHandler(webSocket, request, prxIP, proxyType) {
 
 async function handleTCPOutBound(addressRemote, portRemote, rawClientData, webSocket, responseHeader, log, prxIP, proxyType, wsStream) {
     async function connectTarget(addr, port) {
-        if (prxIP && proxyType) {
-            const parts = prxIP.split(/[:=-]/);
-            const pAddr = parts[0];
-            const pPort = parseInt(parts[1]);
+        if (proxyType) {
+            if (!prxIP) {
+                throw new Error("ProxyType set but no ProxyIP provided in path (Format: /IP:Port)");
+            }
+
+            // Improved IPv6/Separator parsing
+            let sepIdx = -1;
+            if (prxIP.includes('=')) sepIdx = prxIP.lastIndexOf('=');
+            else if (prxIP.includes('-')) sepIdx = prxIP.lastIndexOf('-');
+            else sepIdx = prxIP.lastIndexOf(':');
+
+            if (sepIdx === -1) throw new Error("Invalid Proxy IP format");
+
+            const pAddr = prxIP.substring(0, sepIdx);
+            const pPort = parseInt(prxIP.substring(sepIdx + 1));
+
+            if (isNaN(pPort)) throw new Error("Invalid Proxy Port");
+
             log(`Proxy connect ${pAddr}:${pPort} -> ${addr}:${port}`);
 
             const socket = net.connect(pPort, pAddr);
@@ -290,12 +308,20 @@ async function handleTCPOutBound(addressRemote, portRemote, rawClientData, webSo
 
             return socket;
         } else {
+            // Relay Mode Logic (Legacy)
             if (prxIP && !proxyType) {
-                const parts = prxIP.split(/[:=-]/);
-                const pAddr = parts[0];
-                const pPort = parseInt(parts[1]);
-                log(`Relay connect ${pAddr}:${pPort} -> ${addr}:${port}`);
-                return net.connect(parseInt(parts[1]), parts[0]);
+                // Same parsing logic
+                 let sepIdx = -1;
+                 if (prxIP.includes('=')) sepIdx = prxIP.lastIndexOf('=');
+                 else if (prxIP.includes('-')) sepIdx = prxIP.lastIndexOf('-');
+                 else sepIdx = prxIP.lastIndexOf(':');
+
+                 if (sepIdx !== -1) {
+                     const pAddr = prxIP.substring(0, sepIdx);
+                     const pPort = parseInt(prxIP.substring(sepIdx + 1));
+                     log(`Relay connect ${pAddr}:${pPort} -> ${addr}:${port}`);
+                     return net.connect(pPort, pAddr);
+                 }
             }
             log(`Direct connect ${addr}:${port}`);
             return net.connect(port, addr);
@@ -374,9 +400,18 @@ async function httpProxyConnect(socket, targetAddress, targetPort) {
 
 async function handleUDPOutbound(targetAddress, targetPort, dataChunk, webSocket, responseHeader, log, relay, prxIP, proxyType, wsStream) {
     async function connectTarget() {
-        if (prxIP && proxyType) {
-            const parts = prxIP.split(/[:=-]/);
-            const socket = net.connect(parseInt(parts[1]), parts[0]);
+        if (proxyType) {
+             if (!prxIP) throw new Error("ProxyType set but no ProxyIP provided");
+             let sepIdx = -1;
+             if (prxIP.includes('=')) sepIdx = prxIP.lastIndexOf('=');
+             else if (prxIP.includes('-')) sepIdx = prxIP.lastIndexOf('-');
+             else sepIdx = prxIP.lastIndexOf(':');
+
+             if (sepIdx === -1) throw new Error("Invalid Proxy IP");
+             const pAddr = prxIP.substring(0, sepIdx);
+             const pPort = parseInt(prxIP.substring(sepIdx + 1));
+
+            const socket = net.connect(pPort, pAddr);
             await new Promise((res, rej) => { socket.once('connect', res); socket.once('error', rej); });
             if (proxyType === 'http') await httpProxyConnect(socket, relay.host, relay.port);
             else await socks5Connect(socket, relay.host, relay.port);

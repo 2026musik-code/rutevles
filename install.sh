@@ -226,8 +226,12 @@ server.on('upgrade', async (request, socket, head) => {
     const url = new URL(request.url, `http://${request.headers.host}`);
     let prxIP = "";
     const proxyType = url.searchParams.get("proxyType") || "";
-    const prxMatch = url.pathname.match(/^\/(.+[:=-]\d+)$/);
-    if (prxMatch) prxIP = prxMatch[1];
+
+    // Improved Path Parsing for Proxy
+    let pathSegment = url.pathname.substring(1); // Remove leading /
+    if (pathSegment && (pathSegment.includes(':') || pathSegment.includes('=') || pathSegment.includes('-'))) {
+         prxIP = pathSegment;
+    }
 
     wss.handleUpgrade(request, socket, head, (ws) => {
         websocketHandler(ws, request, prxIP, proxyType);
@@ -339,10 +343,24 @@ async function websocketHandler(webSocket, request, prxIP, proxyType) {
 
 async function handleTCPOutBound(addressRemote, portRemote, rawClientData, webSocket, responseHeader, log, prxIP, proxyType, wsStream) {
     async function connectTarget(addr, port) {
-        if (prxIP && proxyType) {
-            const parts = prxIP.split(/[:=-]/);
-            const pAddr = parts[0];
-            const pPort = parseInt(parts[1]);
+        if (proxyType) {
+            if (!prxIP) {
+                throw new Error("ProxyType set but no ProxyIP provided in path (Format: /IP:Port)");
+            }
+
+            // Improved IPv6/Separator parsing
+            let sepIdx = -1;
+            if (prxIP.includes('=')) sepIdx = prxIP.lastIndexOf('=');
+            else if (prxIP.includes('-')) sepIdx = prxIP.lastIndexOf('-');
+            else sepIdx = prxIP.lastIndexOf(':');
+
+            if (sepIdx === -1) throw new Error("Invalid Proxy IP format");
+
+            const pAddr = prxIP.substring(0, sepIdx);
+            const pPort = parseInt(prxIP.substring(sepIdx + 1));
+
+            if (isNaN(pPort)) throw new Error("Invalid Proxy Port");
+
             log(`Proxy connect ${pAddr}:${pPort} -> ${addr}:${port}`);
 
             const socket = net.connect(pPort, pAddr);
@@ -356,12 +374,20 @@ async function handleTCPOutBound(addressRemote, portRemote, rawClientData, webSo
 
             return socket;
         } else {
+            // Relay Mode Logic (Legacy)
             if (prxIP && !proxyType) {
-                const parts = prxIP.split(/[:=-]/);
-                const pAddr = parts[0];
-                const pPort = parseInt(parts[1]);
-                log(`Relay connect ${pAddr}:${pPort} -> ${addr}:${port}`);
-                return net.connect(parseInt(parts[1]), parts[0]);
+                // Same parsing logic
+                 let sepIdx = -1;
+                 if (prxIP.includes('=')) sepIdx = prxIP.lastIndexOf('=');
+                 else if (prxIP.includes('-')) sepIdx = prxIP.lastIndexOf('-');
+                 else sepIdx = prxIP.lastIndexOf(':');
+
+                 if (sepIdx !== -1) {
+                     const pAddr = prxIP.substring(0, sepIdx);
+                     const pPort = parseInt(prxIP.substring(sepIdx + 1));
+                     log(`Relay connect ${pAddr}:${pPort} -> ${addr}:${port}`);
+                     return net.connect(pPort, pAddr);
+                 }
             }
             log(`Direct connect ${addr}:${port}`);
             return net.connect(port, addr);
@@ -440,9 +466,18 @@ async function httpProxyConnect(socket, targetAddress, targetPort) {
 
 async function handleUDPOutbound(targetAddress, targetPort, dataChunk, webSocket, responseHeader, log, relay, prxIP, proxyType, wsStream) {
     async function connectTarget() {
-        if (prxIP && proxyType) {
-            const parts = prxIP.split(/[:=-]/);
-            const socket = net.connect(parseInt(parts[1]), parts[0]);
+        if (proxyType) {
+             if (!prxIP) throw new Error("ProxyType set but no ProxyIP provided");
+             let sepIdx = -1;
+             if (prxIP.includes('=')) sepIdx = prxIP.lastIndexOf('=');
+             else if (prxIP.includes('-')) sepIdx = prxIP.lastIndexOf('-');
+             else sepIdx = prxIP.lastIndexOf(':');
+
+             if (sepIdx === -1) throw new Error("Invalid Proxy IP");
+             const pAddr = prxIP.substring(0, sepIdx);
+             const pPort = parseInt(prxIP.substring(sepIdx + 1));
+
+            const socket = net.connect(pPort, pAddr);
             await new Promise((res, rej) => { socket.once('connect', res); socket.once('error', rej); });
             if (proxyType === 'http') await httpProxyConnect(socket, relay.host, relay.port);
             else await socks5Connect(socket, relay.host, relay.port);
@@ -598,9 +633,7 @@ function arrayBufferToHex(buf) { return Buffer.from(buf).toString('hex'); }
 server.listen(PORT, () => { console.log(`Server running on ${PORT}`); });
 EOF
 
-# Generate HTML (Content from previous step)
-# NOTE: Use simple cat, the HTML content has no variable expansion conflict usually but better safe.
-# We will use EOF with quotes to be safe.
+# Generate HTML
 cat <<'EOF' > $INSTALL_DIR/public/index.html
 <!DOCTYPE html>
 <html lang="en">
@@ -974,13 +1007,13 @@ cat <<'EOF' > $INSTALL_DIR/public/index.html
                 <div class="form-group">
                     <label>Proxy Route (Optional)</label>
                     <div style="display: flex; gap: 10px;">
-                        <input type="text" id="in_proxy" placeholder="1.2.3.4:1080">
+                        <input type="text" id="in_proxy" placeholder="1.2.3.4:1080" oninput="validateProxyInput()">
                         <select id="in_proxy_type" style="width: 100px;">
                             <option value="socks5">SOCKS5</option>
                             <option value="http">HTTP</option>
                         </select>
                     </div>
-                    <small style="color: var(--text-muted)">Route this user's traffic through an upstream proxy.</small>
+                    <small id="proxy_hint" style="color: var(--text-muted)">Route this user's traffic through an upstream proxy.</small>
                 </div>
                 <div class="form-group">
                     <label>Duration</label>
@@ -1069,8 +1102,26 @@ cat <<'EOF' > $INSTALL_DIR/public/index.html
             renderTable(filtered);
         }
 
+        function validateProxyInput() {
+            const input = document.getElementById('in_proxy').value;
+            const hint = document.getElementById('proxy_hint');
+            if (input && !input.includes(':')) {
+                hint.style.color = 'var(--warning)';
+                hint.innerText = 'Warning: Port missing! Format: IP:Port (e.g. 1.2.3.4:8080)';
+                return false;
+            } else {
+                hint.style.color = 'var(--text-muted)';
+                hint.innerText = 'Route this user\'s traffic through an upstream proxy.';
+                return true;
+            }
+        }
+
         async function createUser(e) {
             e.preventDefault();
+            if (!validateProxyInput()) {
+                if(!confirm('Proxy IP seems to be missing a port. Are you sure?')) return;
+            }
+
             const username = document.getElementById('in_username').value;
             const protocol = document.getElementById('in_protocol').value;
             const proxyRoute = document.getElementById('in_proxy').value;

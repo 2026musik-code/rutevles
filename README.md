@@ -1,4 +1,4 @@
-# DIANA Node.js Server (RuteVless)
+# Nautica Node.js Server (RuteVless)
 
 Repository: [https://github.com/2026musik-code/rutevles](https://github.com/2026musik-code/rutevles)
 

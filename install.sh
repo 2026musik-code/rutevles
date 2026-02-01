@@ -62,8 +62,7 @@ cat <<EOF > $INSTALL_DIR/package.json
 }
 EOF
 
-# Generate server.js (Content from previous step)
-# NOTE: Using cat <<'EOF' with quotes to prevent variable expansion
+# Generate server.js
 cat <<'EOF' > $INSTALL_DIR/server.js
 const http = require('http');
 const net = require('net');
@@ -73,7 +72,6 @@ const path = require('path');
 const { webcrypto, createHash } = require('crypto');
 const crypto = webcrypto;
 
-// Constants
 const DB_FILE = path.join(__dirname, 'users.json');
 const CONFIG_FILE = path.join(__dirname, 'config.json');
 const horse = "dHJvamFu";
@@ -82,8 +80,6 @@ const neko = "dmxlc3M=";
 
 const PORTS = [443, 80];
 const PROTOCOLS = [atob(horse), atob(flash), atob(neko)];
-const DNS_SERVER_ADDRESS = "8.8.8.8";
-const DNS_SERVER_PORT = 53;
 const RELAY_SERVER_UDP = {
   host: "udp-relay.hobihaus.space",
   port: 7300,
@@ -96,7 +92,6 @@ const CORS_HEADER_OPTIONS = {
   "Access-Control-Allow-Headers": "Content-Type, Authorization"
 };
 
-// Encrypted Stream Constants
 const SALT_A1 = atob("Vk1lc3MgSGVhZGVyIEFFQUQgS2V5X0xlbmd0aA==");
 const SALT_A2 = atob("Vk1lc3MgSGVhZGVyIEFFQUQgTm9uY2VfTGVuZ3Ro");
 const SALT_A3 = atob("Vk1lc3MgSGVhZGVyIEFFQUQgS2V5");
@@ -108,16 +103,12 @@ const SALT_B4 = atob("QUVBRCBSZXNwIEhlYWRlciBJVg==");
 
 const PORT = process.env.PORT || 80;
 
-// -- Helpers --
 function atob(str) { return Buffer.from(str, 'base64').toString('binary'); }
 function btoa(str) { return Buffer.from(str, 'binary').toString('base64'); }
 
-// -- Database Helpers --
 function getUsers() {
     if (!fs.existsSync(DB_FILE)) return [];
-    try {
-        return JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
-    } catch { return []; }
+    try { return JSON.parse(fs.readFileSync(DB_FILE, 'utf8')); } catch { return []; }
 }
 
 function saveUser(user) {
@@ -148,37 +139,20 @@ function checkAuth(req) {
     const auth = { login: config.adminUser, password: config.adminPass };
     const b64auth = (req.headers.authorization || '').split(' ')[1] || '';
     const [login, password] = Buffer.from(b64auth, 'base64').toString().split(':');
-
-    if (login && password && login === auth.login && password === auth.password) {
-        return true;
-    }
-    return false;
-}
-
-async function checkPrxHealth(ip, port) {
-    try {
-        const res = await fetch(`${PRX_HEALTH_CHECK_API}?ip=${ip}:${port}`);
-        return await res.json();
-    } catch { return { error: "failed" }; }
+    return login === auth.login && password === auth.password;
 }
 
 const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, `http://${req.headers.host}`);
 
-    // CORS
     if (req.method === 'OPTIONS') {
         res.writeHead(200, CORS_HEADER_OPTIONS);
         res.end();
         return;
     }
 
-    // --- PROTECTED ROUTES ---
-    // Protect EVERYTHING by default, except specific public endpoints
-    const isPublic =
-        url.pathname.startsWith("/check") ||
-        url.pathname.startsWith("/sub");
-
-    if (!isPublic) {
+    const isPublic = url.pathname.startsWith("/check") || url.pathname.startsWith("/sub");
+    if (!isPublic && (url.pathname.startsWith('/api/') || url.pathname === '/' || url.pathname.endsWith('.html'))) {
         if (!checkAuth(req)) {
             res.writeHead(401, { 'WWW-Authenticate': 'Basic realm="Nautica Admin"' });
             res.end('Access denied');
@@ -186,7 +160,6 @@ const server = http.createServer(async (req, res) => {
         }
     }
 
-    // --- API Endpoints ---
     if (url.pathname === '/api/users') {
         if (req.method === 'GET') {
             res.writeHead(200, { ...CORS_HEADER_OPTIONS, 'Content-Type': 'application/json' });
@@ -198,9 +171,7 @@ const server = http.createServer(async (req, res) => {
             req.on('end', () => {
                 try {
                     const data = JSON.parse(body);
-                    if (!data.username || !data.protocol || !data.uuid) {
-                        throw new Error("Missing fields");
-                    }
+                    if (!data.username || !data.protocol || !data.uuid) throw new Error("Missing fields");
                     saveUser(data);
                     res.writeHead(200, CORS_HEADER_OPTIONS);
                     res.end(JSON.stringify({ success: true }));
@@ -221,24 +192,12 @@ const server = http.createServer(async (req, res) => {
         return;
     }
 
-    // --- Static Files (SECURE LFI FIX) ---
-    // Normalize path and prevent directory traversal
     let requestedPath = url.pathname === '/' ? '/index.html' : url.pathname;
-    // Remove query string
     requestedPath = requestedPath.split('?')[0];
-
-    // Normalize logic
     const publicDir = path.join(__dirname, 'public');
     const safePath = path.normalize(path.join(publicDir, requestedPath));
 
-    // Check if path is actually inside publicDir
-    if (!safePath.startsWith(publicDir)) {
-        res.writeHead(403);
-        res.end("Forbidden");
-        return;
-    }
-
-    if (fs.existsSync(safePath) && fs.statSync(safePath).isFile()) {
+    if (safePath.startsWith(publicDir) && fs.existsSync(safePath) && fs.statSync(safePath).isFile()) {
          const ext = path.extname(safePath);
          const mime = { '.html': 'text/html', '.css': 'text/css', '.js': 'text/javascript' }[ext] || 'text/plain';
          res.writeHead(200, { 'Content-Type': mime });
@@ -253,9 +212,7 @@ const server = http.createServer(async (req, res) => {
             const json = await cres.json();
             res.writeHead(200, { ...CORS_HEADER_OPTIONS, "Content-Type": "application/json" });
             res.end(JSON.stringify(json));
-        } catch(e) {
-            res.writeHead(500); res.end("{}");
-        }
+        } catch(e) { res.writeHead(500); res.end("{}"); }
         return;
     }
 
@@ -279,6 +236,7 @@ server.on('upgrade', async (request, socket, head) => {
 
 async function websocketHandler(webSocket, request, prxIP, proxyType) {
     const wsStream = WebSocket.createWebSocketStream(webSocket);
+    const log = (msg) => console.log(`[WS] ${msg}`);
 
     wsStream.once('data', async (chunk) => {
         wsStream.pause();
@@ -289,20 +247,22 @@ async function websocketHandler(webSocket, request, prxIP, proxyType) {
             let uuid = "";
             let authenticated = false;
 
+            log(`Sniffed Protocol: ${protocol}`);
+
             if (protocol === atob(horse)) { // Trojan
-                const result = await readHorseHeader(chunk);
-                protocolHeader = result;
-                if (!result.hasError) {
-                    if (isValidTrojanUser(result.passwordHash)) {
-                        authenticated = true;
-                    }
+                protocolHeader = readHorseHeader(chunk);
+                if (!protocolHeader.hasError && isValidTrojanUser(protocolHeader.passwordHash)) {
+                    authenticated = true;
                 }
             } else if (protocol === atob(neko)) { // VLESS
                 protocolHeader = readNekoHeader(chunk);
                 uuid = arrayBufferToHex(chunk.slice(1, 17));
                 const formattedUUID = `${uuid.substr(0,8)}-${uuid.substr(8,4)}-${uuid.substr(12,4)}-${uuid.substr(16,4)}-${uuid.substr(20,12)}`;
+                log(`VLESS UUID: ${formattedUUID}`);
                 if (isValidUser(formattedUUID)) {
                     authenticated = true;
+                } else {
+                    log(`User not found in DB: ${formattedUUID}`);
                 }
             } else if (protocol === atob(flash)) { // VMess
                 const users = getUsers().filter(u => u.protocol === 'vmess');
@@ -311,23 +271,21 @@ async function websocketHandler(webSocket, request, prxIP, proxyType) {
                     if (!result.hasError) {
                         protocolHeader = result;
                         authenticated = true;
+                        log(`VMess Auth Success: ${user.uuid}`);
                         break;
                     }
                 }
-
-                if (!authenticated) {
-                    protocolHeader = { hasError: true, message: "Authentication failed" };
-                }
             } else {
+                log("Unknown Protocol Data: " + chunk.toString('hex').substring(0, 50));
                 throw new Error("Unknown Protocol");
             }
 
-            if (protocolHeader.hasError) {
-                throw new Error(protocolHeader.message);
+            if (!protocolHeader || protocolHeader.hasError) {
+                throw new Error(protocolHeader ? protocolHeader.message : "Header Parse Failed");
             }
 
             if (!authenticated) {
-                console.log("Authentication Failed");
+                log("Authentication Failed");
                 webSocket.close();
                 return;
             }
@@ -341,23 +299,9 @@ async function websocketHandler(webSocket, request, prxIP, proxyType) {
                 );
             }
 
-            if (protocolHeader.isUDP) {
-                if (protocolHeader.portRemote === 53) {
-                    await handleUDPOutbound(
-                        DNS_SERVER_ADDRESS,
-                        DNS_SERVER_PORT,
-                        chunk,
-                        webSocket,
-                        responseHeader,
-                        log,
-                        RELAY_SERVER_UDP,
-                        prxIP,
-                        proxyType,
-                        wsStream
-                    );
-                    return;
-                }
+            log(`Connecting to Target: ${protocolHeader.addressRemote}:${protocolHeader.portRemote} (UDP: ${protocolHeader.isUDP})`);
 
+            if (protocolHeader.isUDP) {
                 await handleUDPOutbound(
                     protocolHeader.addressRemote,
                     protocolHeader.portRemote,
@@ -370,91 +314,27 @@ async function websocketHandler(webSocket, request, prxIP, proxyType) {
                     proxyType,
                     wsStream
                 );
-                return;
+            } else {
+                await handleTCPOutBound(
+                    protocolHeader.addressRemote,
+                    protocolHeader.portRemote,
+                    protocolHeader.rawClientData,
+                    webSocket,
+                    responseHeader,
+                    log,
+                    prxIP,
+                    proxyType,
+                    wsStream
+                );
             }
 
-            await handleTCPOutBound(
-                protocolHeader.addressRemote,
-                protocolHeader.portRemote,
-                protocolHeader.rawClientData,
-                webSocket,
-                responseHeader,
-                log,
-                prxIP,
-                proxyType,
-                wsStream
-            );
-
         } catch (err) {
-            console.log("Handler Error", err.message);
+            log(`Error: ${err.message}`);
             webSocket.close();
         }
     });
 
-    wsStream.on('error', (err) => console.log("WS Stream Error", err.message));
-}
-
-async function socks5Connect(socket, targetAddress, targetPort) {
-    return new Promise((resolve, reject) => {
-        const onHandshakeError = (err) => reject(err);
-        socket.once('error', onHandshakeError);
-
-        socket.write(new Uint8Array([0x05, 0x01, 0x00]));
-
-        socket.once('data', (data) => {
-            if (!data || data[0] !== 0x05 || data[1] !== 0x00) {
-                socket.removeListener('error', onHandshakeError);
-                return reject(new Error("SOCKS5 greeting failed"));
-            }
-
-            const portBuffer = Buffer.alloc(2);
-            portBuffer.writeUInt16BE(targetPort);
-
-            let addressType;
-            let addressBuffer;
-
-            if (net.isIPv4(targetAddress)) {
-                addressType = 0x01;
-                addressBuffer = Buffer.from(targetAddress.split('.').map(Number));
-            } else {
-                addressType = 0x03;
-                addressBuffer = Buffer.from([targetAddress.length, ...Buffer.from(targetAddress)]);
-            }
-
-            const request = Buffer.concat([
-                Buffer.from([0x05, 0x01, 0x00, addressType]),
-                addressBuffer,
-                portBuffer
-            ]);
-
-            socket.write(request);
-
-            socket.once('data', (data2) => {
-                socket.removeListener('error', onHandshakeError);
-                if (!data2 || data2[0] !== 0x05 || data2[1] !== 0x00) {
-                    return reject(new Error("SOCKS5 connection failed"));
-                }
-                resolve(socket);
-            });
-        });
-    });
-}
-
-async function httpProxyConnect(socket, targetAddress, targetPort) {
-    return new Promise((resolve, reject) => {
-        const req = `CONNECT ${targetAddress}:${targetPort} HTTP/1.1\r\nHost: ${targetAddress}:${targetPort}\r\n\r\n`;
-        socket.write(req);
-
-        socket.once('data', (data) => {
-            const response = data.toString();
-            if (response.includes("200 Connection Established") || response.includes("200 OK")) {
-                resolve(socket);
-            } else {
-                reject(new Error("HTTP Proxy connection failed: " + response.split('\r\n')[0]));
-            }
-        });
-        socket.once('error', (err) => reject(err));
-    });
+    wsStream.on('error', (err) => log(`Stream Error: ${err.message}`));
 }
 
 async function handleTCPOutBound(addressRemote, portRemote, rawClientData, webSocket, responseHeader, log, prxIP, proxyType, wsStream) {
@@ -463,7 +343,7 @@ async function handleTCPOutBound(addressRemote, portRemote, rawClientData, webSo
             const parts = prxIP.split(/[:=-]/);
             const pAddr = parts[0];
             const pPort = parseInt(parts[1]);
-            log(`Proxy connect ${pAddr}:${pPort} (${proxyType}) -> ${addr}:${port}`);
+            log(`Proxy connect ${pAddr}:${pPort} -> ${addr}:${port}`);
 
             const socket = net.connect(pPort, pAddr);
             await new Promise((res, rej) => {
@@ -478,8 +358,12 @@ async function handleTCPOutBound(addressRemote, portRemote, rawClientData, webSo
         } else {
             if (prxIP && !proxyType) {
                 const parts = prxIP.split(/[:=-]/);
+                const pAddr = parts[0];
+                const pPort = parseInt(parts[1]);
+                log(`Relay connect ${pAddr}:${pPort} -> ${addr}:${port}`);
                 return net.connect(parseInt(parts[1]), parts[0]);
             }
+            log(`Direct connect ${addr}:${port}`);
             return net.connect(port, addr);
         }
     }
@@ -487,440 +371,231 @@ async function handleTCPOutBound(addressRemote, portRemote, rawClientData, webSo
     try {
         const tcpSocket = await connectTarget(addressRemote, portRemote);
 
-        if (rawClientData && rawClientData.length > 0) {
-            tcpSocket.write(rawClientData);
-        }
-
         if (responseHeader && responseHeader.length > 0) {
             wsStream.write(Buffer.from(responseHeader));
         }
 
+        if (rawClientData && rawClientData.length > 0) {
+            tcpSocket.write(rawClientData);
+        }
+
         wsStream.resume();
+
         wsStream.pipe(tcpSocket);
         tcpSocket.pipe(wsStream);
 
-        tcpSocket.on('error', (e) => {});
-        tcpSocket.on('close', () => webSocket.close());
+        tcpSocket.on('error', (e) => log(`TCP Error: ${e.message}`));
+        tcpSocket.on('close', () => {
+            log("TCP Closed");
+            webSocket.close();
+        });
 
     } catch (e) {
+        log(`Outbound Connection Failed: ${e.message}`);
         webSocket.close();
     }
+}
+
+async function socks5Connect(socket, targetAddress, targetPort) {
+    return new Promise((resolve, reject) => {
+        const onHandshakeError = (err) => reject(err);
+        socket.once('error', onHandshakeError);
+        socket.write(new Uint8Array([0x05, 0x01, 0x00]));
+        socket.once('data', (data) => {
+            if (!data || data[0] !== 0x05 || data[1] !== 0x00) {
+                socket.removeListener('error', onHandshakeError);
+                return reject(new Error("SOCKS5 greeting failed"));
+            }
+            const portBuffer = Buffer.alloc(2);
+            portBuffer.writeUInt16BE(targetPort);
+            let addressType, addressBuffer;
+            if (net.isIPv4(targetAddress)) {
+                addressType = 0x01;
+                addressBuffer = Buffer.from(targetAddress.split('.').map(Number));
+            } else {
+                addressType = 0x03;
+                addressBuffer = Buffer.from([targetAddress.length, ...Buffer.from(targetAddress)]);
+            }
+            socket.write(Buffer.concat([Buffer.from([0x05, 0x01, 0x00, addressType]), addressBuffer, portBuffer]));
+            socket.once('data', (data2) => {
+                socket.removeListener('error', onHandshakeError);
+                if (!data2 || data2[0] !== 0x05 || data2[1] !== 0x00) return reject(new Error("SOCKS5 connection failed"));
+                resolve(socket);
+            });
+        });
+    });
+}
+
+async function httpProxyConnect(socket, targetAddress, targetPort) {
+    return new Promise((resolve, reject) => {
+        const req = `CONNECT ${targetAddress}:${targetPort} HTTP/1.1\r\nHost: ${targetAddress}:${targetPort}\r\n\r\n`;
+        socket.write(req);
+        socket.once('data', (data) => {
+            if (data.toString().includes("200")) resolve(socket);
+            else reject(new Error("HTTP Proxy failed"));
+        });
+        socket.once('error', reject);
+    });
 }
 
 async function handleUDPOutbound(targetAddress, targetPort, dataChunk, webSocket, responseHeader, log, relay, prxIP, proxyType, wsStream) {
     async function connectTarget() {
         if (prxIP && proxyType) {
             const parts = prxIP.split(/[:=-]/);
-            const pAddr = parts[0];
-            const pPort = parseInt(parts[1]);
-
-            const socket = net.connect(pPort, pAddr);
-            await new Promise((res, rej) => {
-                socket.once('connect', res);
-                socket.once('error', rej);
-            });
-
+            const socket = net.connect(parseInt(parts[1]), parts[0]);
+            await new Promise((res, rej) => { socket.once('connect', res); socket.once('error', rej); });
             if (proxyType === 'http') await httpProxyConnect(socket, relay.host, relay.port);
             else await socks5Connect(socket, relay.host, relay.port);
-
             return socket;
-        } else {
-            return net.connect(relay.port, relay.host);
-        }
+        } else return net.connect(relay.port, relay.host);
     }
 
     try {
         const socket = await connectTarget();
+        if (responseHeader) wsStream.write(Buffer.from(responseHeader));
 
         const header = `udp:${targetAddress}:${targetPort}`;
-        const headerBuffer = Buffer.from(header);
-        const separator = Buffer.from([0x7c]);
-        const payload = Buffer.concat([headerBuffer, separator, Buffer.from(dataChunk)]);
+        const payload = Buffer.concat([Buffer.from(header), Buffer.from([0x7c]), Buffer.from(dataChunk)]);
         socket.write(payload);
-
-        if (responseHeader) {
-            wsStream.write(Buffer.from(responseHeader));
-        }
 
         wsStream.resume();
         wsStream.pipe(socket);
         socket.pipe(wsStream);
-
-        socket.on('error', (e) => {});
-        socket.on('close', () => {});
-
-    } catch(e) {
-        webSocket.close();
-    }
+        socket.on('error', (e) => log(`UDP Error: ${e.message}`));
+    } catch(e) { webSocket.close(); }
 }
 
 async function protocolSniffer(buffer) {
+    if (buffer.length >= 18 && buffer[0] === 0) return atob(neko);
     if (buffer.length >= 62) {
-        const horseDelimiter = buffer.slice(56, 60);
-        if (horseDelimiter[0] === 0x0d && horseDelimiter[1] === 0x0a) {
-             if (horseDelimiter[2] === 0x01 || horseDelimiter[2] === 0x03 || horseDelimiter[2] === 0x7f) {
-                 if (horseDelimiter[3] === 0x01 || horseDelimiter[3] === 0x03 || horseDelimiter[3] === 0x04) return atob(horse);
-             }
-        }
+        const d = buffer.slice(56, 60);
+        if (d[0]===0x0d && d[1]===0x0a) return atob(horse);
     }
-    if (buffer.length >= 18) {
-        const version = buffer[0];
-        if (version === 0) return atob(neko);
-    }
-    if (buffer.length >= 42) {
-        const first = buffer[0];
-        if (first === 1 || first === 3 || first === 4) return "ss";
-        return atob(flash);
-    }
+    if (buffer.length >= 42) return atob(flash);
     return "";
 }
 
-function isValidTrojanUser(hashBuffer) {
-    const receivedHash = hashBuffer.toString();
+function isValidTrojanUser(hash) {
     const users = getUsers().filter(u => u.protocol === 'trojan');
-    for (const user of users) {
-        const userHash = createHash('sha224').update(user.uuid).digest('hex');
-        if (userHash === receivedHash) {
-            const expDate = new Date(user.expiredDate);
-            if (new Date() > expDate) return false;
-            return true;
-        }
+    for (const u of users) {
+        if (createHash('sha224').update(u.uuid).digest('hex') === hash) return true;
     }
     return false;
 }
 
 function readHorseHeader(buffer) {
-    const dataBuffer = buffer.slice(58);
-    if (dataBuffer.length < 6) return { hasError: true, message: "invalid request data" };
+    if (buffer.length < 58) return { hasError: true };
+    const hash = buffer.slice(0, 56).toString();
+    const data = buffer.slice(58);
+    if (data.length < 6) return { hasError: true };
 
-    const cmd = dataBuffer[0];
-    const isUDP = cmd === 3;
-    const addressType = dataBuffer[1];
-    let offset = 2;
-    let addressValue = "";
+    const cmd = data[0];
+    const atype = data[1];
+    let off = 2;
+    let addr = "";
+    if (atype === 1) { addr = data.slice(off, off+4).join('.'); off+=4; }
+    else if (atype === 3) { const l = data[off]; off++; addr = data.slice(off, off+l).toString(); off+=l; }
+    else if (atype === 4) { off+=16; addr="ipv6"; } // Simplify
+    else return { hasError: true };
 
-    if (addressType === 1) {
-        addressValue = dataBuffer.slice(offset, offset+4).join('.');
-        offset += 4;
-    } else if (addressType === 3) {
-        const len = dataBuffer[offset];
-        offset++;
-        addressValue = dataBuffer.slice(offset, offset+len).toString();
-        offset += len;
-    } else if (addressType === 4) {
-        const ipv6 = [];
-        for (let i = 0; i < 8; i++) {
-            ipv6.push(dataBuffer.readUInt16BE(offset + i * 2).toString(16));
-        }
-        addressValue = ipv6.join(":");
-        offset += 16;
-    } else {
-        return { hasError: true, message: `invalid addressType is ${addressType}` };
-    }
-
-    const portRemote = dataBuffer.readUInt16BE(offset);
-    return {
-        hasError: false,
-        addressRemote: addressValue,
-        portRemote: portRemote,
-        isUDP,
-        rawClientData: dataBuffer.slice(offset+2),
-        version: null,
-        passwordHash: buffer.slice(0, 56).toString()
-    };
+    const port = data.readUInt16BE(off);
+    return { hasError: false, addressRemote: addr, portRemote: port, isUDP: cmd===3, rawClientData: data.slice(off+2), passwordHash: hash };
 }
 
 function readNekoHeader(buffer) {
-    const version = buffer[0];
-    const optLength = buffer[17];
-    const cmd = buffer[18 + optLength];
-    const isUDP = cmd === 2;
-    const portIndex = 18 + optLength + 1;
-    const portRemote = buffer.readUInt16BE(portIndex);
+    const ver = buffer[0];
+    const optLen = buffer[17];
+    const cmd = buffer[18+optLen];
+    const portInd = 18+optLen+1;
+    const port = buffer.readUInt16BE(portInd);
+    const atype = buffer[portInd+2];
+    let off = portInd+3;
+    let addr = "";
+    if (atype === 1) { addr = buffer.slice(off, off+4).join('.'); off+=4; }
+    else if (atype === 2) { const l = buffer[off]; off++; addr = buffer.slice(off, off+l).toString(); off+=l; }
+    else if (atype === 3) { off+=16; addr="ipv6"; }
 
-    let addressIndex = portIndex + 2;
-    const addressType = buffer[addressIndex];
-    let addressValue = "";
-    let offset = addressIndex + 1;
-
-    if (addressType === 1) {
-        addressValue = buffer.slice(offset, offset+4).join('.');
-        offset += 4;
-    } else if (addressType === 2) {
-        const len = buffer[offset];
-        offset++;
-        addressValue = buffer.slice(offset, offset+len).toString();
-        offset += len;
-    } else if (addressType === 3) {
-        const ipv6 = [];
-        for (let i = 0; i < 8; i++) {
-            ipv6.push(buffer.readUInt16BE(offset + i * 2).toString(16));
-        }
-        addressValue = ipv6.join(":");
-        offset += 16;
-    }
-
-    return {
-        hasError: false,
-        addressRemote: addressValue,
-        portRemote,
-        isUDP,
-        rawClientData: buffer.slice(offset),
-        version: new Uint8Array([version, 0]),
-    };
+    return { hasError: false, addressRemote: addr, portRemote: port, isUDP: cmd===2, rawClientData: buffer.slice(off), version: new Uint8Array([ver, 0]) };
 }
 
-function readSsHeader(ssBuffer) {
-  const view = ssBuffer;
-  const addressType = view[0];
-  let addressLength = 0;
-  let addressValueIndex = 1;
-  let addressValue = "";
-
-  switch (addressType) {
-    case 1:
-      addressLength = 4;
-      addressValue = view.slice(addressValueIndex, addressValueIndex + addressLength).join(".");
-      break;
-    case 3:
-      addressLength = view[addressValueIndex];
-      addressValueIndex += 1;
-      addressValue = view.slice(addressValueIndex, addressValueIndex + addressLength).toString();
-      break;
-    case 4:
-      addressLength = 16;
-      const ipv6 = [];
-      for (let i = 0; i < 8; i++) {
-        ipv6.push(view.readUInt16BE(addressValueIndex + i * 2).toString(16));
-      }
-      addressValue = ipv6.join(":");
-      break;
-    default:
-      return { hasError: true, message: `Invalid addressType for SS: ${addressType}` };
-  }
-
-  const portIndex = addressValueIndex + addressLength;
-  const portRemote = view.readUInt16BE(portIndex);
-  return {
-    hasError: false,
-    addressRemote: addressValue,
-    addressType: addressType,
-    portRemote: portRemote,
-    rawDataIndex: portIndex + 2,
-    rawClientData: ssBuffer.slice(portIndex + 2),
-    version: null,
-    isUDP: portRemote == 53,
-  };
-}
-
-async function readStreamHeader(buffer, userUUID) {
+async function readStreamHeader(buffer, uuid) {
     try {
-        const uuidBytes = new Uint8Array(
-          userUUID.replace(/-/g, "").match(/.{1,2}/g).map((byte) => parseInt(byte, 16))
-        );
-
-        const authKey = await md5(
-          uuidBytes,
-          new TextEncoder().encode(atob("YzQ4NjE5ZmUtOGYwMi00OWUwLWI5ZTktZWRmNzYzZTE3ZTIx")),
-        );
-
+        const keyBytes = new Uint8Array(uuid.replace(/-/g, "").match(/.{1,2}/g).map(b => parseInt(b, 16)));
+        const authKey = await md5(keyBytes, new TextEncoder().encode(atob("YzQ4NjE5ZmUtOGYwMi00OWUwLWI5ZTktZWRmNzYzZTE3ZTIx")));
         const authId = buffer.slice(0, 16);
-        const encryptedLength = buffer.slice(16, 34);
+        const encLen = buffer.slice(16, 34);
         const nonce = buffer.slice(34, 42);
 
-        const lengthKey = (await kdf(authKey, [SALT_A1, authId, nonce])).slice(0, 16);
-        const lengthIv = (await kdf(authKey, [SALT_A2, authId, nonce])).slice(0, 12);
+        const lKey = (await kdf(authKey, [SALT_A1, authId, nonce])).slice(0, 16);
+        const lIv = (await kdf(authKey, [SALT_A2, authId, nonce])).slice(0, 12);
+        const lBytes = await aesGcmDecrypt(lKey, lIv, encLen, authId);
+        const hLen = (lBytes[0] << 8) | lBytes[1];
 
-        const lengthBytes = await aesGcmDecrypt(lengthKey, lengthIv, encryptedLength, authId);
-        const headerLength = (lengthBytes[0] << 8) | lengthBytes[1];
+        const encHead = buffer.slice(42, 42 + hLen + 16);
+        const pKey = (await kdf(authKey, [SALT_A3, authId, nonce])).slice(0, 16);
+        const pIv = (await kdf(authKey, [SALT_A4, authId, nonce])).slice(0, 12);
+        const head = await aesGcmDecrypt(pKey, pIv, encHead, authId);
 
-        const encryptedHeader = buffer.slice(42, 42 + headerLength + 16);
+        const view = Buffer.from(head);
+        let off = 0;
+        const ver = view[off++];
+        const encIv = view.slice(off, off+16); off+=16;
+        const encKey = view.slice(off, off+16); off+=16;
+        const opts = view.slice(off, off+4); off+=4;
+        const cmd = view[off++];
+        const port = view.readUInt16BE(off); off+=2;
+        const atype = view[off++];
+        let addr = "";
+        if (atype === 1) { addr = view.slice(off, off+4).join('.'); off+=4; }
+        else if (atype === 2) { const l = view[off++]; addr = view.slice(off, off+l).toString(); off+=l; }
 
-        const payloadKey = (await kdf(authKey, [SALT_A3, authId, nonce])).slice(0, 16);
-        const payloadIv = (await kdf(authKey, [SALT_A4, authId, nonce])).slice(0, 12);
-
-        const headerPayload = await aesGcmDecrypt(payloadKey, payloadIv, encryptedHeader, authId);
-
-        const view = Buffer.from(headerPayload);
-        let offset = 0;
-
-        const version = view[offset]; offset++;
-        if (version !== 1) return { hasError: true, message: `Invalid protocol version: ${version}` };
-
-        const encIv = view.slice(offset, offset+16); offset+=16;
-        const encKey = view.slice(offset, offset+16); offset+=16;
-        const options = view.slice(offset, offset+4); offset+=4;
-        const cmd = view[offset]; offset++;
-        const isUDP = cmd !== 1;
-        const portRemote = view.readUInt16BE(offset); offset+=2;
-        const addressType = view[offset]; offset++;
-
-        let addressRemote = "";
-        if (addressType === 1) {
-            addressRemote = view.slice(offset, offset+4).join('.'); offset+=4;
-        } else if (addressType === 2 || addressType === 3) {
-            const len = view[offset]; offset++;
-            addressRemote = view.slice(offset, offset+len).toString(); offset+=len;
-        } else if (addressType === 4) {
-            const ipv6 = [];
-            for(let i=0; i<8; i++) ipv6.push(view.readUInt16BE(offset+i*2).toString(16));
-            addressRemote = ipv6.join(":"); offset+=16;
-        }
-
-        const rawDataIndex = 42 + headerLength + 16;
-
-        return {
-            hasError: false,
-            addressRemote,
-            portRemote,
-            rawDataIndex,
-            rawClientData: buffer.slice(rawDataIndex),
-            version: new Uint8Array([options[0], 0]),
-            isUDP,
-            needsResponse: true,
-            responseOptions: options,
-            encKey,
-            encIv
-        };
-
-    } catch (e) {
-        return { hasError: true, message: e.message };
-    }
+        return { hasError: false, addressRemote: addr, portRemote: port, isUDP: cmd!==1, rawClientData: buffer.slice(42+hLen+16), version: new Uint8Array([opts[0], 0]), encKey, encIv, needsResponse: true, responseOptions: opts };
+    } catch(e) { return { hasError: true, message: e.message }; }
 }
 
-async function generateStreamResponseHeader(responseOptions, encKey, encIv) {
-  try {
-    const key = (await sha256(encKey)).slice(0, 16);
-    const iv = (await sha256(encIv)).slice(0, 16);
+async function generateStreamResponseHeader(opts, key, iv) {
+    try {
+        const sKey = (await sha256(key)).slice(0, 16);
+        const sIv = (await sha256(iv)).slice(0, 16);
+        const rLenKey = (await kdf(sKey, [SALT_B1])).slice(0, 16);
+        const rLenIv = (await kdf(sIv, [SALT_B2])).slice(0, 12);
+        const rLenData = new Uint8Array([0, 4]);
+        const encLen = await aesGcmEncrypt(rLenKey, rLenIv, rLenData, new Uint8Array(0));
 
-    const lengthKey = (await kdf(key, [SALT_B1])).slice(0, 16);
-    const lengthIv = (await kdf(iv, [SALT_B2])).slice(0, 12);
+        const rHead = new Uint8Array([opts[0], 0, 0, 0]);
+        const rHeadKey = (await kdf(sKey, [SALT_B3])).slice(0, 16);
+        const rHeadIv = (await kdf(sIv, [SALT_B4])).slice(0, 12);
+        const encHead = await aesGcmEncrypt(rHeadKey, rHeadIv, rHead, new Uint8Array(0));
 
-    const lengthData = new Uint8Array(2);
-    lengthData[0] = 0;
-    lengthData[1] = 4;
-
-    const encryptedLength = await aesGcmEncrypt(lengthKey, lengthIv, lengthData, new Uint8Array(0));
-
-    const headerPayload = new Uint8Array([
-      responseOptions[0],
-      0x00,
-      0x00,
-      0x00,
-    ]);
-
-    const payloadKey = (await kdf(key, [SALT_B3])).slice(0, 16);
-    const payloadIv = (await kdf(iv, [SALT_B4])).slice(0, 12);
-
-    const encryptedPayload = await aesGcmEncrypt(payloadKey, payloadIv, headerPayload, new Uint8Array(0));
-
-    const response = new Uint8Array(encryptedLength.length + encryptedPayload.length);
-    response.set(encryptedLength, 0);
-    response.set(encryptedPayload, encryptedLength.length);
-
-    return response;
-  } catch (e) {
-    return new Uint8Array(0);
-  }
+        return Buffer.concat([encLen, encHead]);
+    } catch(e) { return Buffer.alloc(0); }
 }
 
-async function md5(...inputs) {
-  const combined = Buffer.concat(inputs.map(i => Buffer.from(i)));
-  return new Uint8Array(createHash('md5').update(combined).digest());
+async function md5(...args) { return new Uint8Array(createHash('md5').update(Buffer.concat(args.map(a=>Buffer.from(a)))).digest()); }
+async function sha256(d) { return new Uint8Array(await crypto.subtle.digest("SHA-256", d)); }
+async function aesGcmDecrypt(k, n, d, a) {
+    const key = await crypto.subtle.importKey("raw", k, {name:"AES-GCM"}, false, ["decrypt"]);
+    return new Uint8Array(await crypto.subtle.decrypt({name:"AES-GCM", iv:n, additionalData:a}, key, d));
 }
-
-async function sha256(input) {
-  const hashBuffer = await crypto.subtle.digest("SHA-256", input);
-  return new Uint8Array(hashBuffer);
+async function aesGcmEncrypt(k, n, d, a) {
+    const key = await crypto.subtle.importKey("raw", k, {name:"AES-GCM"}, false, ["encrypt"]);
+    return new Uint8Array(await crypto.subtle.encrypt({name:"AES-GCM", iv:n, additionalData:a}, key, d));
 }
-
 async function kdf(key, path) {
-  async function hmacSha256(key, data) {
-    const hmacKey = await crypto.subtle.importKey("raw", key, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
-    const signature = await crypto.subtle.sign("HMAC", hmacKey, data);
-    return new Uint8Array(signature);
-  }
-
-  async function recursiveHash(keyBytes, innerHashFn) {
-    return async (data) => {
-      const ipad = new Uint8Array(64);
-      const opad = new Uint8Array(64);
-
-      ipad.set(keyBytes.slice(0, Math.min(64, keyBytes.length)));
-      opad.set(keyBytes.slice(0, Math.min(64, keyBytes.length)));
-
-      for (let i = 0; i < 64; i++) {
-        ipad[i] ^= 0x36;
-        opad[i] ^= 0x5c;
-      }
-
-      const innerData = new Uint8Array(ipad.length + data.length);
-      innerData.set(ipad);
-      innerData.set(data, ipad.length);
-      const innerResult = await innerHashFn(innerData);
-
-      const outerData = new Uint8Array(opad.length + innerResult.length);
-      outerData.set(opad);
-      outerData.set(innerResult, opad.length);
-      return await innerHashFn(outerData);
-    };
-  }
-
-  const sha256Hash = async (data) => {
-    return new Uint8Array(await crypto.subtle.digest("SHA-256", data));
-  };
-
-  let currentHashFn = await recursiveHash(new TextEncoder().encode("VMess AEAD KDF"), sha256Hash);
-
-  for (const salt of path) {
-    const saltBytes = typeof salt === "string" ? new TextEncoder().encode(salt) : new Uint8Array(salt);
-    currentHashFn = await recursiveHash(saltBytes, currentHashFn);
-  }
-
-  return await currentHashFn(key);
-}
-
-async function aesGcmDecrypt(key, nonce, data, aad) {
-  const cryptoKey = await crypto.subtle.importKey("raw", key, { name: "AES-GCM" }, false, ["decrypt"]);
-
-  try {
-    const decrypted = await crypto.subtle.decrypt({ name: "AES-GCM", iv: nonce, additionalData: aad }, cryptoKey, data);
-    return new Uint8Array(decrypted);
-  } catch (e) {
-    throw new Error("AEAD decryption failed: " + e.message);
-  }
-}
-
-async function aesGcmEncrypt(key, nonce, data, aad) {
-  const cryptoKey = await crypto.subtle.importKey("raw", key, { name: "AES-GCM" }, false, ["encrypt"]);
-
-  const encrypted = await crypto.subtle.encrypt({ name: "AES-GCM", iv: nonce, additionalData: aad }, cryptoKey, data);
-  return new Uint8Array(encrypted);
-}
-
-function arrayBufferToHex(buffer) {
-  return [...new Uint8Array(buffer)].map((x) => x.toString(16).padStart(2, "0")).join("");
-}
-
-function shuffleArray(array) {
-    for (let i = array.length - 1; i > 0; i--) {
-        const j = Math.floor(Math.random() * (i + 1));
-        [array[i], array[j]] = [array[j], array[i]];
+    async function hmac(k, d) {
+        const key = await crypto.subtle.importKey("raw", k, {name:"HMAC", hash:"SHA-256"}, false, ["sign"]);
+        return new Uint8Array(await crypto.subtle.sign("HMAC", key, d));
     }
+    let result = key;
+    for (const p of path) {
+        result = await hmac(result, p);
+    }
+    return result;
 }
 
-function getFlagEmoji(isoCode) {
-  if(!isoCode) return "";
-  const codePoints = isoCode
-    .toUpperCase()
-    .split("")
-    .map((char) => 127397 + char.charCodeAt(0));
-  return String.fromCodePoint(...codePoints);
-}
+function arrayBufferToHex(buf) { return Buffer.from(buf).toString('hex'); }
 
-server.listen(PORT, () => {
-    console.log(`Server listening on port ${PORT}`);
-});
+server.listen(PORT, () => { console.log(`Server running on ${PORT}`); });
 EOF
 
 # Generate HTML (Content from previous step)
@@ -1448,7 +1123,7 @@ cat <<'EOF' > $INSTALL_DIR/public/index.html
             if (proxyRoute && proxyRoute.trim()) {
                 path = `/${proxyRoute}?proxyType=${proxyType}`;
             } else {
-                path = `/${host}:80`;
+                path = '/';
             }
 
             let link = '';

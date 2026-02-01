@@ -555,11 +555,14 @@
         function copyConfig(uuid, protocol, username, proxyRoute, proxyType) {
             const host = window.location.hostname;
             const port = 443;
-            let path = '/';
+
+            // Dynamic Path Logic
+            let path = `/${protocol}`; // Default: /vless, /vmess, /trojan
+
+            // Proxy Logic: Append as Query Param if exists, or Path if strictly required
+            // Updated Server Logic supports ?proxyip=...
             if (proxyRoute && proxyRoute.trim()) {
-                path = `/${proxyRoute}?proxyType=${proxyType}`;
-            } else {
-                path = '/';
+                path += `?proxyip=${proxyRoute}&proxyType=${proxyType}`;
             }
 
             let link = '';

@@ -237,9 +237,16 @@ server.on('upgrade', async (request, socket, head) => {
     let prxIP = "";
     const proxyType = url.searchParams.get("proxyType") || "";
 
-    let pathSegment = url.pathname.substring(1);
-    if (pathSegment && (pathSegment.includes(':') || pathSegment.includes('=') || pathSegment.includes('-'))) {
-         prxIP = pathSegment;
+    // Check for ProxyIP in Query Params first (cleaner URLs)
+    const qProxy = url.searchParams.get("proxyip");
+    if (qProxy) {
+        prxIP = qProxy;
+    } else {
+        // Fallback to path-based ProxyIP (legacy support)
+        let pathSegment = url.pathname.substring(1);
+        if (pathSegment && (pathSegment.includes(':') || pathSegment.includes('=') || pathSegment.includes('-'))) {
+             prxIP = pathSegment;
+        }
     }
 
     wss.handleUpgrade(request, socket, head, (ws) => {
@@ -252,7 +259,6 @@ async function websocketHandler(webSocket, request, prxIP, proxyType) {
     const log = (msg) => console.log(`[WS] ${msg}`);
 
     wsStream.once('data', async (chunk) => {
-        // IMPORTANT: Pause immediately to prevent data loss during async operations
         wsStream.pause();
 
         try {
@@ -356,6 +362,10 @@ async function handleTCPOutbound(addressRemote, portRemote, rawClientData, webSo
             const pPort = parseInt(prxIP.substring(sepIdx + 1));
 
             const socket = net.connect(pPort, pAddr);
+            // Optimization: Speed & Ping
+            socket.setNoDelay(true);
+            socket.setKeepAlive(true);
+
             await new Promise((res, rej) => {
                 socket.once('connect', res);
                 socket.once('error', rej);
@@ -372,20 +382,21 @@ async function handleTCPOutbound(addressRemote, portRemote, rawClientData, webSo
                  if (sepIdx !== -1) {
                      const pAddr = prxIP.substring(0, sepIdx);
                      const pPort = parseInt(prxIP.substring(sepIdx + 1));
-                     return { socket: net.connect(pPort, pAddr), leftover: null };
+                     const s = net.connect(pPort, pAddr);
+                     s.setNoDelay(true);
+                     s.setKeepAlive(true);
+                     return { socket: s, leftover: null };
                  }
             }
-            return { socket: net.connect(port, addr), leftover: null };
+            const s = net.connect(port, addr);
+            s.setNoDelay(true); // Disable Nagle's algorithm for speed
+            s.setKeepAlive(true); // Keep connection alive for better ping on idle
+            return { socket: s, leftover: null };
         }
     }
 
     try {
         const { socket: tcpSocket, leftover } = await connectTarget(addressRemote, portRemote);
-
-        // 3. Write Initial Payload (stripped of header) to TCP
-        // IMPORTANT: We must write this BEFORE piping the stream, because the stream
-        // has already emitted the first chunk (which contained the header + this payload).
-        // The pipe won't re-emit it.
 
         if (leftover && leftover.length > 0) {
             tcpSocket.write(leftover);
@@ -395,11 +406,9 @@ async function handleTCPOutbound(addressRemote, portRemote, rawClientData, webSo
             tcpSocket.write(rawClientData);
         }
 
-        // 4. Pipe
         wsStream.pipe(tcpSocket);
         tcpSocket.pipe(wsStream);
 
-        // 5. Resume
         wsStream.resume();
 
         tcpSocket.on('error', (e) => log(`TCP Error: ${e.message}`));
@@ -415,15 +424,6 @@ async function handleTCPOutbound(addressRemote, portRemote, rawClientData, webSo
 }
 
 async function handleUDPOutbound(targetAddress, targetPort, dataChunk, webSocket, wsStream, log, relay, prxIP, proxyType) {
-     // For UDP, we construct the packet and send it.
-     // NOTE: WebSocketStream might not be ideal for packet-based UDP logic if we need to parse every frame.
-     // But for standard VLESS over UDP, the stream contains 16-bit length prefix + packet.
-     // The "Native" implementation usually just pipes to a UDP relay.
-
-     // However, the provided reference logic (Nautica) wraps UDP in a custom header:
-     // `udp:${targetAddress}:${targetPort}|${payload}`
-     // and sends it to a Relay Server.
-
     try {
         let socket;
          if (proxyType) {
@@ -431,6 +431,8 @@ async function handleUDPOutbound(targetAddress, targetPort, dataChunk, webSocket
              socket = s;
          } else {
              socket = net.connect(relay.port, relay.host);
+             socket.setNoDelay(true);
+             socket.setKeepAlive(true);
          }
 
         // Initial Payload
@@ -438,15 +440,6 @@ async function handleUDPOutbound(targetAddress, targetPort, dataChunk, webSocket
         const payload = Buffer.concat([Buffer.from(header), Buffer.from([0x7c]), Buffer.from(dataChunk)]);
         socket.write(payload);
 
-        // Resume stream to pipe subsequent data?
-        // If the client sends more UDP packets over the same WS connection, they are usually framed.
-        // We probably need to parse them if we want to re-wrap them.
-        // But for simplicity/speed, we pipe directly to the relay socket?
-        // The relay socket expects `udp:...` header for *every* packet?
-        // Or is it a stream where the first packet sets the session?
-        // Based on `RELAY_SERVER_UDP` it seems like a custom protocol.
-
-        // Assuming the stream is just raw data after the first chunk for now (simple tunnel)
         wsStream.pipe(socket);
         socket.pipe(wsStream);
         wsStream.resume();
@@ -471,6 +464,9 @@ async function handleUDPOutbound(targetAddress, targetPort, dataChunk, webSocket
             const pPort = parseInt(prxIP.substring(sepIdx + 1));
 
             const socket = net.connect(pPort, pAddr);
+            socket.setNoDelay(true);
+            socket.setKeepAlive(true);
+
             await new Promise((res, rej) => {
                 socket.once('connect', res);
                 socket.once('error', rej);
@@ -479,7 +475,10 @@ async function handleUDPOutbound(targetAddress, targetPort, dataChunk, webSocket
             if (proxyType === 'http') return await httpProxyConnect(socket, host, port);
             else return await socks5Connect(socket, host, port);
         } else {
-            return { socket: net.connect(port, host), leftover: null };
+            const s = net.connect(port, host);
+            s.setNoDelay(true);
+            s.setKeepAlive(true);
+            return { socket: s, leftover: null };
         }
     }
 }

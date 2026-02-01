@@ -305,9 +305,16 @@ server.on('upgrade', async (request, socket, head) => {
     let prxIP = "";
     const proxyType = url.searchParams.get("proxyType") || "";
 
-    let pathSegment = url.pathname.substring(1);
-    if (pathSegment && (pathSegment.includes(':') || pathSegment.includes('=') || pathSegment.includes('-'))) {
-         prxIP = pathSegment;
+    // Check for ProxyIP in Query Params first (cleaner URLs)
+    const qProxy = url.searchParams.get("proxyip");
+    if (qProxy) {
+        prxIP = qProxy;
+    } else {
+        // Fallback to path-based ProxyIP (legacy support)
+        let pathSegment = url.pathname.substring(1);
+        if (pathSegment && (pathSegment.includes(':') || pathSegment.includes('=') || pathSegment.includes('-'))) {
+             prxIP = pathSegment;
+        }
     }
 
     wss.handleUpgrade(request, socket, head, (ws) => {
@@ -320,7 +327,6 @@ async function websocketHandler(webSocket, request, prxIP, proxyType) {
     const log = (msg) => console.log(`[WS] ${msg}`);
 
     wsStream.once('data', async (chunk) => {
-        // IMPORTANT: Pause immediately to prevent data loss during async operations
         wsStream.pause();
 
         try {
@@ -424,6 +430,10 @@ async function handleTCPOutbound(addressRemote, portRemote, rawClientData, webSo
             const pPort = parseInt(prxIP.substring(sepIdx + 1));
 
             const socket = net.connect(pPort, pAddr);
+            // Optimization: Speed & Ping
+            socket.setNoDelay(true);
+            socket.setKeepAlive(true);
+
             await new Promise((res, rej) => {
                 socket.once('connect', res);
                 socket.once('error', rej);
@@ -440,20 +450,21 @@ async function handleTCPOutbound(addressRemote, portRemote, rawClientData, webSo
                  if (sepIdx !== -1) {
                      const pAddr = prxIP.substring(0, sepIdx);
                      const pPort = parseInt(prxIP.substring(sepIdx + 1));
-                     return { socket: net.connect(pPort, pAddr), leftover: null };
+                     const s = net.connect(pPort, pAddr);
+                     s.setNoDelay(true);
+                     s.setKeepAlive(true);
+                     return { socket: s, leftover: null };
                  }
             }
-            return { socket: net.connect(port, addr), leftover: null };
+            const s = net.connect(port, addr);
+            s.setNoDelay(true); // Disable Nagle's algorithm for speed
+            s.setKeepAlive(true); // Keep connection alive for better ping on idle
+            return { socket: s, leftover: null };
         }
     }
 
     try {
         const { socket: tcpSocket, leftover } = await connectTarget(addressRemote, portRemote);
-
-        // 3. Write Initial Payload (stripped of header) to TCP
-        // IMPORTANT: We must write this BEFORE piping the stream, because the stream
-        // has already emitted the first chunk (which contained the header + this payload).
-        // The pipe won't re-emit it.
 
         if (leftover && leftover.length > 0) {
             tcpSocket.write(leftover);
@@ -463,11 +474,9 @@ async function handleTCPOutbound(addressRemote, portRemote, rawClientData, webSo
             tcpSocket.write(rawClientData);
         }
 
-        // 4. Pipe
         wsStream.pipe(tcpSocket);
         tcpSocket.pipe(wsStream);
 
-        // 5. Resume
         wsStream.resume();
 
         tcpSocket.on('error', (e) => log(`TCP Error: ${e.message}`));
@@ -490,6 +499,8 @@ async function handleUDPOutbound(targetAddress, targetPort, dataChunk, webSocket
              socket = s;
          } else {
              socket = net.connect(relay.port, relay.host);
+             socket.setNoDelay(true);
+             socket.setKeepAlive(true);
          }
 
         // Initial Payload
@@ -521,6 +532,9 @@ async function handleUDPOutbound(targetAddress, targetPort, dataChunk, webSocket
             const pPort = parseInt(prxIP.substring(sepIdx + 1));
 
             const socket = net.connect(pPort, pAddr);
+            socket.setNoDelay(true);
+            socket.setKeepAlive(true);
+
             await new Promise((res, rej) => {
                 socket.once('connect', res);
                 socket.once('error', rej);
@@ -529,7 +543,10 @@ async function handleUDPOutbound(targetAddress, targetPort, dataChunk, webSocket
             if (proxyType === 'http') return await httpProxyConnect(socket, host, port);
             else return await socks5Connect(socket, host, port);
         } else {
-            return { socket: net.connect(port, host), leftover: null };
+            const s = net.connect(port, host);
+            s.setNoDelay(true);
+            s.setKeepAlive(true);
+            return { socket: s, leftover: null };
         }
     }
 }
@@ -1275,11 +1292,14 @@ cat <<'EOF' > $INSTALL_DIR/public/index.html
         function copyConfig(uuid, protocol, username, proxyRoute, proxyType) {
             const host = window.location.hostname;
             const port = 443;
-            let path = '/';
+
+            // Dynamic Path Logic
+            let path = `/${protocol}`; // Default: /vless, /vmess, /trojan
+
+            // Proxy Logic: Append as Query Param if exists, or Path if strictly required
+            // Updated Server Logic supports ?proxyip=...
             if (proxyRoute && proxyRoute.trim()) {
-                path = `/${proxyRoute}?proxyType=${proxyType}`;
-            } else {
-                path = '/';
+                path += `?proxyip=${proxyRoute}&proxyType=${proxyType}`;
             }
 
             let link = '';

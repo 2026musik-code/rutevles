@@ -69,17 +69,17 @@ const net = require('net');
 const WebSocket = require('ws');
 const fs = require('fs');
 const path = require('path');
-const { webcrypto, createHash } = require('crypto');
+const { webcrypto, createHash, randomUUID } = require('crypto');
 const crypto = webcrypto;
 
 const DB_FILE = path.join(__dirname, 'users.json');
 const CONFIG_FILE = path.join(__dirname, 'config.json');
+const SESSIONS = new Map(); // Simple in-memory session store
+
 const horse = "dHJvamFu";
 const flash = "dm1lc3M=";
 const neko = "dmxlc3M=";
 
-const PORTS = [443, 80];
-const PROTOCOLS = [atob(horse), atob(flash), atob(neko)];
 const RELAY_SERVER_UDP = {
   host: "udp-relay.hobihaus.space",
   port: 7300,
@@ -131,19 +131,56 @@ function isValidUser(uuid) {
     return true;
 }
 
-function checkAuth(req) {
-    if (!fs.existsSync(CONFIG_FILE)) return true;
-    let config = { adminUser: 'admin', adminPass: 'admin' };
-    try { config = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')); } catch {}
+function getAdminCredentials() {
+    if (!fs.existsSync(CONFIG_FILE)) return { adminUser: 'admin', adminPass: 'admin' };
+    try { return JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')); } catch { return { adminUser: 'admin', adminPass: 'admin' }; }
+}
 
-    const auth = { login: config.adminUser, password: config.adminPass };
-    const b64auth = (req.headers.authorization || '').split(' ')[1] || '';
-    const [login, password] = Buffer.from(b64auth, 'base64').toString().split(':');
-    return login === auth.login && password === auth.password;
+function checkAuth(req) {
+    // Cookie Auth
+    const cookieHeader = req.headers.cookie;
+    if (cookieHeader) {
+        const cookies = cookieHeader.split(';').reduce((acc, cookie) => {
+            const [name, value] = cookie.trim().split('=');
+            acc[name] = value;
+            return acc;
+        }, {});
+        if (cookies.session_token && SESSIONS.has(cookies.session_token)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, `http://${req.headers.host}`);
+
+    // API: Login
+    if (url.pathname === '/api/login' && req.method === 'POST') {
+        let body = '';
+        req.on('data', chunk => body += chunk);
+        req.on('end', () => {
+            try {
+                const { username, password } = JSON.parse(body);
+                const creds = getAdminCredentials();
+                if (username === creds.adminUser && password === creds.adminPass) {
+                    const token = randomUUID();
+                    SESSIONS.set(token, { user: username, created: Date.now() });
+                    res.writeHead(200, {
+                        'Set-Cookie': `session_token=${token}; HttpOnly; Path=/; Max-Age=86400`,
+                        'Content-Type': 'application/json'
+                    });
+                    res.end(JSON.stringify({ success: true }));
+                } else {
+                    res.writeHead(401, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ error: "Invalid credentials" }));
+                }
+            } catch {
+                res.writeHead(400); res.end();
+            }
+        });
+        return;
+    }
 
     if (req.method === 'OPTIONS') {
         res.writeHead(200, CORS_HEADER_OPTIONS);
@@ -151,11 +188,19 @@ const server = http.createServer(async (req, res) => {
         return;
     }
 
-    const isPublic = url.pathname.startsWith("/check") || url.pathname.startsWith("/sub");
+    const isPublic = url.pathname.startsWith("/check") || url.pathname.startsWith("/sub") || url.pathname === '/login.html';
+
+    // Auth Check for Protected Routes
     if (!isPublic && (url.pathname.startsWith('/api/') || url.pathname === '/' || url.pathname.endsWith('.html'))) {
         if (!checkAuth(req)) {
-            res.writeHead(401, { 'WWW-Authenticate': 'Basic realm="Nautica Admin"' });
-            res.end('Access denied');
+            // Redirect to login if accessing HTML, otherwise 401
+            if (url.pathname === '/' || url.pathname.endsWith('.html')) {
+                res.writeHead(302, { 'Location': '/login.html' });
+                res.end();
+            } else {
+                res.writeHead(401);
+                res.end('Unauthorized');
+            }
             return;
         }
     }
@@ -227,8 +272,7 @@ server.on('upgrade', async (request, socket, head) => {
     let prxIP = "";
     const proxyType = url.searchParams.get("proxyType") || "";
 
-    // Improved Path Parsing for Proxy
-    let pathSegment = url.pathname.substring(1); // Remove leading /
+    let pathSegment = url.pathname.substring(1);
     if (pathSegment && (pathSegment.includes(':') || pathSegment.includes('=') || pathSegment.includes('-'))) {
          prxIP = pathSegment;
     }
@@ -344,11 +388,8 @@ async function websocketHandler(webSocket, request, prxIP, proxyType) {
 async function handleTCPOutBound(addressRemote, portRemote, rawClientData, webSocket, responseHeader, log, prxIP, proxyType, wsStream) {
     async function connectTarget(addr, port) {
         if (proxyType) {
-            if (!prxIP) {
-                throw new Error("ProxyType set but no ProxyIP provided in path (Format: /IP:Port)");
-            }
+            if (!prxIP) throw new Error("ProxyType set but no ProxyIP provided");
 
-            // Improved IPv6/Separator parsing
             let sepIdx = -1;
             if (prxIP.includes('=')) sepIdx = prxIP.lastIndexOf('=');
             else if (prxIP.includes('-')) sepIdx = prxIP.lastIndexOf('-');
@@ -369,14 +410,14 @@ async function handleTCPOutBound(addressRemote, portRemote, rawClientData, webSo
                 socket.once('error', rej);
             });
 
-            if (proxyType === 'http') await httpProxyConnect(socket, addr, port);
-            else await socks5Connect(socket, addr, port);
+            let result;
+            if (proxyType === 'http') result = await httpProxyConnect(socket, addr, port);
+            else result = await socks5Connect(socket, addr, port);
 
-            return socket;
+            return result; // returns { socket, leftover }
         } else {
-            // Relay Mode Logic (Legacy)
-            if (prxIP && !proxyType) {
-                // Same parsing logic
+             // Relay Mode (Legacy)
+             if (prxIP && !proxyType) {
                  let sepIdx = -1;
                  if (prxIP.includes('=')) sepIdx = prxIP.lastIndexOf('=');
                  else if (prxIP.includes('-')) sepIdx = prxIP.lastIndexOf('-');
@@ -386,19 +427,24 @@ async function handleTCPOutBound(addressRemote, portRemote, rawClientData, webSo
                      const pAddr = prxIP.substring(0, sepIdx);
                      const pPort = parseInt(prxIP.substring(sepIdx + 1));
                      log(`Relay connect ${pAddr}:${pPort} -> ${addr}:${port}`);
-                     return net.connect(pPort, pAddr);
+                     return { socket: net.connect(pPort, pAddr), leftover: null };
                  }
             }
             log(`Direct connect ${addr}:${port}`);
-            return net.connect(port, addr);
+            return { socket: net.connect(port, addr), leftover: null };
         }
     }
 
     try {
-        const tcpSocket = await connectTarget(addressRemote, portRemote);
+        const { socket: tcpSocket, leftover } = await connectTarget(addressRemote, portRemote);
 
         if (responseHeader && responseHeader.length > 0) {
             wsStream.write(Buffer.from(responseHeader));
+        }
+
+        // Write any leftover data from the proxy handshake
+        if (leftover && leftover.length > 0) {
+            wsStream.write(leftover);
         }
 
         if (rawClientData && rawClientData.length > 0) {
@@ -443,10 +489,26 @@ async function socks5Connect(socket, targetAddress, targetPort) {
                 addressBuffer = Buffer.from([targetAddress.length, ...Buffer.from(targetAddress)]);
             }
             socket.write(Buffer.concat([Buffer.from([0x05, 0x01, 0x00, addressType]), addressBuffer, portBuffer]));
+
             socket.once('data', (data2) => {
                 socket.removeListener('error', onHandshakeError);
                 if (!data2 || data2[0] !== 0x05 || data2[1] !== 0x00) return reject(new Error("SOCKS5 connection failed"));
-                resolve(socket);
+
+                // Check for leftover data
+                let leftover = null;
+                // SOCKS5 Reply: VER | REP | RSV | ATYP | BND.ADDR | BND.PORT
+                // standard length varies by address type.
+                // V5 success is usually: 05 00 00 01 <4 bytes IP> <2 bytes Port> = 10 bytes for IPv4.
+                let headerLen = 0;
+                if (data2[3] === 0x01) headerLen = 10;
+                else if (data2[3] === 0x04) headerLen = 22; // IPv6
+                else if (data2[3] === 0x03) headerLen = 7 + data2[4]; // Domain
+
+                if (data2.length > headerLen) {
+                    leftover = data2.slice(headerLen);
+                }
+
+                resolve({ socket, leftover });
             });
         });
     });
@@ -457,7 +519,15 @@ async function httpProxyConnect(socket, targetAddress, targetPort) {
         const req = `CONNECT ${targetAddress}:${targetPort} HTTP/1.1\r\nHost: ${targetAddress}:${targetPort}\r\n\r\n`;
         socket.write(req);
         socket.once('data', (data) => {
-            if (data.toString().includes("200")) resolve(socket);
+            if (data.toString().includes("200")) {
+                let leftover = null;
+                const doubleCRLF = Buffer.from("\r\n\r\n");
+                const idx = data.indexOf(doubleCRLF);
+                if (idx !== -1 && idx + 4 < data.length) {
+                    leftover = data.slice(idx + 4);
+                }
+                resolve({ socket, leftover });
+            }
             else reject(new Error("HTTP Proxy failed"));
         });
         socket.once('error', reject);
@@ -479,9 +549,11 @@ async function handleUDPOutbound(targetAddress, targetPort, dataChunk, webSocket
 
             const socket = net.connect(pPort, pAddr);
             await new Promise((res, rej) => { socket.once('connect', res); socket.once('error', rej); });
-            if (proxyType === 'http') await httpProxyConnect(socket, relay.host, relay.port);
-            else await socks5Connect(socket, relay.host, relay.port);
-            return socket;
+
+            let res;
+            if (proxyType === 'http') res = await httpProxyConnect(socket, relay.host, relay.port);
+            else res = await socks5Connect(socket, relay.host, relay.port);
+            return res.socket; // UDP packets handled differently, assuming no leftover on UDP setup
         } else return net.connect(relay.port, relay.host);
     }
 
@@ -633,7 +705,9 @@ function arrayBufferToHex(buf) { return Buffer.from(buf).toString('hex'); }
 server.listen(PORT, () => { console.log(`Server running on ${PORT}`); });
 EOF
 
-# Generate HTML
+# Generate HTML (Content from previous step)
+# NOTE: Use simple cat, the HTML content has no variable expansion conflict usually but better safe.
+# We will use EOF with quotes to be safe.
 cat <<'EOF' > $INSTALL_DIR/public/index.html
 <!DOCTYPE html>
 <html lang="en">
@@ -1054,7 +1128,10 @@ cat <<'EOF' > $INSTALL_DIR/public/index.html
         async function loadData() {
             try {
                 const res = await fetch(API_URL);
-                if (res.status === 401) return; // Auth handled by browser
+                if (res.status === 401) {
+                    window.location.href = '/login.html'; // Redirect to login
+                    return;
+                }
                 allUsers = await res.json();
                 renderTable(allUsers);
                 document.getElementById('stat-total').innerText = allUsers.length;
@@ -1199,6 +1276,154 @@ cat <<'EOF' > $INSTALL_DIR/public/index.html
             div.innerHTML = `<span>${msg}</span>`;
             document.getElementById('toast-container').appendChild(div);
             setTimeout(() => div.remove(), 3000);
+        }
+    </script>
+</body>
+</html>
+EOF
+
+# Generate Login HTML
+cat <<'EOF' > $INSTALL_DIR/public/login.html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Nautica Admin Login</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #0f172a;
+            color: #f8fafc;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            overflow: hidden;
+        }
+
+        /* Ambient Background */
+        .ambient {
+            position: absolute;
+            width: 100%;
+            height: 100%;
+            z-index: 1;
+            background: radial-gradient(circle at 50% 10%, rgba(59, 130, 246, 0.15) 0%, transparent 60%);
+        }
+
+        .login-card {
+            background-color: #1e293b;
+            border: 1px solid #334155;
+            padding: 40px;
+            border-radius: 16px;
+            width: 100%;
+            max-width: 400px;
+            z-index: 10;
+            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
+            animation: floatUp 0.6s cubic-bezier(0.2, 0.8, 0.2, 1);
+        }
+
+        @keyframes floatUp {
+            from { transform: translateY(20px); opacity: 0; }
+            to { transform: translateY(0); opacity: 1; }
+        }
+
+        .brand {
+            text-align: center;
+            margin-bottom: 32px;
+            font-size: 1.75rem;
+            font-weight: 700;
+            color: #3b82f6;
+            letter-spacing: -0.5px;
+        }
+
+        .form-group { margin-bottom: 20px; }
+        .form-group label {
+            display: block;
+            margin-bottom: 8px;
+            font-size: 0.85rem;
+            color: #94a3b8;
+        }
+        .form-group input {
+            width: 100%;
+            padding: 12px;
+            border-radius: 8px;
+            background-color: #0f172a;
+            border: 1px solid #334155;
+            color: white;
+            outline: none;
+            transition: border-color 0.2s;
+            font-family: inherit;
+        }
+        .form-group input:focus { border-color: #3b82f6; }
+
+        .btn {
+            width: 100%;
+            padding: 12px;
+            background-color: #3b82f6;
+            color: white;
+            border: none;
+            border-radius: 8px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background-color 0.2s;
+            margin-top: 10px;
+        }
+        .btn:hover { background-color: #2563eb; }
+
+        .error-msg {
+            color: #ef4444;
+            text-align: center;
+            margin-bottom: 20px;
+            font-size: 0.9rem;
+            display: none;
+        }
+    </style>
+</head>
+<body>
+    <div class="ambient"></div>
+    <div class="login-card">
+        <div class="brand">Nautica Admin</div>
+        <div id="error" class="error-msg">Invalid credentials</div>
+        <form onsubmit="handleLogin(event)">
+            <div class="form-group">
+                <label>Username</label>
+                <input type="text" id="username" required autocomplete="off">
+            </div>
+            <div class="form-group">
+                <label>Password</label>
+                <input type="password" id="password" required>
+            </div>
+            <button type="submit" class="btn">Sign In</button>
+        </form>
+    </div>
+
+    <script>
+        async function handleLogin(e) {
+            e.preventDefault();
+            const u = document.getElementById('username').value;
+            const p = document.getElementById('password').value;
+            const err = document.getElementById('error');
+
+            try {
+                const res = await fetch('/api/login', {
+                    method: 'POST',
+                    body: JSON.stringify({ username: u, password: p })
+                });
+                const data = await res.json();
+
+                if (data.success) {
+                    window.location.href = '/index.html';
+                } else {
+                    err.style.display = 'block';
+                    err.innerText = data.error || 'Login failed';
+                }
+            } catch {
+                err.style.display = 'block';
+                err.innerText = 'Connection error';
+            }
         }
     </script>
 </body>

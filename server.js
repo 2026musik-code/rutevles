@@ -3,17 +3,17 @@ const net = require('net');
 const WebSocket = require('ws');
 const fs = require('fs');
 const path = require('path');
-const { webcrypto, createHash } = require('crypto');
+const { webcrypto, createHash, randomUUID } = require('crypto');
 const crypto = webcrypto;
 
 const DB_FILE = path.join(__dirname, 'users.json');
 const CONFIG_FILE = path.join(__dirname, 'config.json');
+const SESSIONS = new Map(); // Simple in-memory session store
+
 const horse = "dHJvamFu";
 const flash = "dm1lc3M=";
 const neko = "dmxlc3M=";
 
-const PORTS = [443, 80];
-const PROTOCOLS = [atob(horse), atob(flash), atob(neko)];
 const RELAY_SERVER_UDP = {
   host: "udp-relay.hobihaus.space",
   port: 7300,
@@ -65,19 +65,56 @@ function isValidUser(uuid) {
     return true;
 }
 
-function checkAuth(req) {
-    if (!fs.existsSync(CONFIG_FILE)) return true;
-    let config = { adminUser: 'admin', adminPass: 'admin' };
-    try { config = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')); } catch {}
+function getAdminCredentials() {
+    if (!fs.existsSync(CONFIG_FILE)) return { adminUser: 'admin', adminPass: 'admin' };
+    try { return JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')); } catch { return { adminUser: 'admin', adminPass: 'admin' }; }
+}
 
-    const auth = { login: config.adminUser, password: config.adminPass };
-    const b64auth = (req.headers.authorization || '').split(' ')[1] || '';
-    const [login, password] = Buffer.from(b64auth, 'base64').toString().split(':');
-    return login === auth.login && password === auth.password;
+function checkAuth(req) {
+    // Cookie Auth
+    const cookieHeader = req.headers.cookie;
+    if (cookieHeader) {
+        const cookies = cookieHeader.split(';').reduce((acc, cookie) => {
+            const [name, value] = cookie.trim().split('=');
+            acc[name] = value;
+            return acc;
+        }, {});
+        if (cookies.session_token && SESSIONS.has(cookies.session_token)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, `http://${req.headers.host}`);
+
+    // API: Login
+    if (url.pathname === '/api/login' && req.method === 'POST') {
+        let body = '';
+        req.on('data', chunk => body += chunk);
+        req.on('end', () => {
+            try {
+                const { username, password } = JSON.parse(body);
+                const creds = getAdminCredentials();
+                if (username === creds.adminUser && password === creds.adminPass) {
+                    const token = randomUUID();
+                    SESSIONS.set(token, { user: username, created: Date.now() });
+                    res.writeHead(200, {
+                        'Set-Cookie': `session_token=${token}; HttpOnly; Path=/; Max-Age=86400`,
+                        'Content-Type': 'application/json'
+                    });
+                    res.end(JSON.stringify({ success: true }));
+                } else {
+                    res.writeHead(401, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ error: "Invalid credentials" }));
+                }
+            } catch {
+                res.writeHead(400); res.end();
+            }
+        });
+        return;
+    }
 
     if (req.method === 'OPTIONS') {
         res.writeHead(200, CORS_HEADER_OPTIONS);
@@ -85,11 +122,19 @@ const server = http.createServer(async (req, res) => {
         return;
     }
 
-    const isPublic = url.pathname.startsWith("/check") || url.pathname.startsWith("/sub");
+    const isPublic = url.pathname.startsWith("/check") || url.pathname.startsWith("/sub") || url.pathname === '/login.html';
+
+    // Auth Check for Protected Routes
     if (!isPublic && (url.pathname.startsWith('/api/') || url.pathname === '/' || url.pathname.endsWith('.html'))) {
         if (!checkAuth(req)) {
-            res.writeHead(401, { 'WWW-Authenticate': 'Basic realm="Nautica Admin"' });
-            res.end('Access denied');
+            // Redirect to login if accessing HTML, otherwise 401
+            if (url.pathname === '/' || url.pathname.endsWith('.html')) {
+                res.writeHead(302, { 'Location': '/login.html' });
+                res.end();
+            } else {
+                res.writeHead(401);
+                res.end('Unauthorized');
+            }
             return;
         }
     }
@@ -161,8 +206,7 @@ server.on('upgrade', async (request, socket, head) => {
     let prxIP = "";
     const proxyType = url.searchParams.get("proxyType") || "";
 
-    // Improved Path Parsing for Proxy
-    let pathSegment = url.pathname.substring(1); // Remove leading /
+    let pathSegment = url.pathname.substring(1);
     if (pathSegment && (pathSegment.includes(':') || pathSegment.includes('=') || pathSegment.includes('-'))) {
          prxIP = pathSegment;
     }
@@ -278,11 +322,8 @@ async function websocketHandler(webSocket, request, prxIP, proxyType) {
 async function handleTCPOutBound(addressRemote, portRemote, rawClientData, webSocket, responseHeader, log, prxIP, proxyType, wsStream) {
     async function connectTarget(addr, port) {
         if (proxyType) {
-            if (!prxIP) {
-                throw new Error("ProxyType set but no ProxyIP provided in path (Format: /IP:Port)");
-            }
+            if (!prxIP) throw new Error("ProxyType set but no ProxyIP provided");
 
-            // Improved IPv6/Separator parsing
             let sepIdx = -1;
             if (prxIP.includes('=')) sepIdx = prxIP.lastIndexOf('=');
             else if (prxIP.includes('-')) sepIdx = prxIP.lastIndexOf('-');
@@ -303,14 +344,14 @@ async function handleTCPOutBound(addressRemote, portRemote, rawClientData, webSo
                 socket.once('error', rej);
             });
 
-            if (proxyType === 'http') await httpProxyConnect(socket, addr, port);
-            else await socks5Connect(socket, addr, port);
+            let result;
+            if (proxyType === 'http') result = await httpProxyConnect(socket, addr, port);
+            else result = await socks5Connect(socket, addr, port);
 
-            return socket;
+            return result; // returns { socket, leftover }
         } else {
-            // Relay Mode Logic (Legacy)
-            if (prxIP && !proxyType) {
-                // Same parsing logic
+             // Relay Mode (Legacy)
+             if (prxIP && !proxyType) {
                  let sepIdx = -1;
                  if (prxIP.includes('=')) sepIdx = prxIP.lastIndexOf('=');
                  else if (prxIP.includes('-')) sepIdx = prxIP.lastIndexOf('-');
@@ -320,19 +361,24 @@ async function handleTCPOutBound(addressRemote, portRemote, rawClientData, webSo
                      const pAddr = prxIP.substring(0, sepIdx);
                      const pPort = parseInt(prxIP.substring(sepIdx + 1));
                      log(`Relay connect ${pAddr}:${pPort} -> ${addr}:${port}`);
-                     return net.connect(pPort, pAddr);
+                     return { socket: net.connect(pPort, pAddr), leftover: null };
                  }
             }
             log(`Direct connect ${addr}:${port}`);
-            return net.connect(port, addr);
+            return { socket: net.connect(port, addr), leftover: null };
         }
     }
 
     try {
-        const tcpSocket = await connectTarget(addressRemote, portRemote);
+        const { socket: tcpSocket, leftover } = await connectTarget(addressRemote, portRemote);
 
         if (responseHeader && responseHeader.length > 0) {
             wsStream.write(Buffer.from(responseHeader));
+        }
+
+        // Write any leftover data from the proxy handshake
+        if (leftover && leftover.length > 0) {
+            wsStream.write(leftover);
         }
 
         if (rawClientData && rawClientData.length > 0) {
@@ -377,10 +423,26 @@ async function socks5Connect(socket, targetAddress, targetPort) {
                 addressBuffer = Buffer.from([targetAddress.length, ...Buffer.from(targetAddress)]);
             }
             socket.write(Buffer.concat([Buffer.from([0x05, 0x01, 0x00, addressType]), addressBuffer, portBuffer]));
+
             socket.once('data', (data2) => {
                 socket.removeListener('error', onHandshakeError);
                 if (!data2 || data2[0] !== 0x05 || data2[1] !== 0x00) return reject(new Error("SOCKS5 connection failed"));
-                resolve(socket);
+
+                // Check for leftover data
+                let leftover = null;
+                // SOCKS5 Reply: VER | REP | RSV | ATYP | BND.ADDR | BND.PORT
+                // standard length varies by address type.
+                // V5 success is usually: 05 00 00 01 <4 bytes IP> <2 bytes Port> = 10 bytes for IPv4.
+                let headerLen = 0;
+                if (data2[3] === 0x01) headerLen = 10;
+                else if (data2[3] === 0x04) headerLen = 22; // IPv6
+                else if (data2[3] === 0x03) headerLen = 7 + data2[4]; // Domain
+
+                if (data2.length > headerLen) {
+                    leftover = data2.slice(headerLen);
+                }
+
+                resolve({ socket, leftover });
             });
         });
     });
@@ -391,7 +453,15 @@ async function httpProxyConnect(socket, targetAddress, targetPort) {
         const req = `CONNECT ${targetAddress}:${targetPort} HTTP/1.1\r\nHost: ${targetAddress}:${targetPort}\r\n\r\n`;
         socket.write(req);
         socket.once('data', (data) => {
-            if (data.toString().includes("200")) resolve(socket);
+            if (data.toString().includes("200")) {
+                let leftover = null;
+                const doubleCRLF = Buffer.from("\r\n\r\n");
+                const idx = data.indexOf(doubleCRLF);
+                if (idx !== -1 && idx + 4 < data.length) {
+                    leftover = data.slice(idx + 4);
+                }
+                resolve({ socket, leftover });
+            }
             else reject(new Error("HTTP Proxy failed"));
         });
         socket.once('error', reject);
@@ -413,9 +483,11 @@ async function handleUDPOutbound(targetAddress, targetPort, dataChunk, webSocket
 
             const socket = net.connect(pPort, pAddr);
             await new Promise((res, rej) => { socket.once('connect', res); socket.once('error', rej); });
-            if (proxyType === 'http') await httpProxyConnect(socket, relay.host, relay.port);
-            else await socks5Connect(socket, relay.host, relay.port);
-            return socket;
+
+            let res;
+            if (proxyType === 'http') res = await httpProxyConnect(socket, relay.host, relay.port);
+            else res = await socks5Connect(socket, relay.host, relay.port);
+            return res.socket; // UDP packets handled differently, assuming no leftover on UDP setup
         } else return net.connect(relay.port, relay.host);
     }
 

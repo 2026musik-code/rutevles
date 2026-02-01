@@ -23,7 +23,6 @@ const CORS_HEADER_OPTIONS = {
   "Access-Control-Allow-Headers": "Content-Type, Authorization"
 };
 
-// ... Crypto Constants ...
 const SALT_A1 = atob("Vk1lc3MgSGVhZGVyIEFFQUQgS2V5X0xlbmd0aA==");
 const SALT_A2 = atob("Vk1lc3MgSGVhZGVyIEFFQUQgTm9uY2VfTGVuZ3Ro");
 const SALT_A3 = atob("Vk1lc3MgSGVhZGVyIEFFQUQgS2V5");
@@ -35,7 +34,6 @@ const SALT_B4 = atob("QUVBRCBSZXNwIEhlYWRlciBJVg==");
 
 const PORT = process.env.PORT || 80;
 
-// --- Helpers ---
 function atob(str) { return Buffer.from(str, 'base64').toString('binary'); }
 function btoa(str) { return Buffer.from(str, 'binary').toString('base64'); }
 function arrayBufferToHex(buf) { return Buffer.from(buf).toString('hex'); }
@@ -78,44 +76,30 @@ function getAdminCredentials() {
     try { return JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')); } catch { return { adminUser: 'admin', adminPass: 'admin' }; }
 }
 
-// --- System Stats Helper ---
+// Stats
 let previousCpuUsage = null;
 let publicIP = "Loading...";
-
-// Fetch Public IP once on start
-exec('curl -s https://api.ipify.org', (err, stdout) => {
-    if (!err) publicIP = stdout.trim();
-});
+exec('curl -s https://api.ipify.org', (err, stdout) => { if (!err) publicIP = stdout.trim(); });
 
 function getCpuUsage() {
     const cpus = os.cpus();
     let user = 0, nice = 0, sys = 0, idle = 0, irq = 0;
-
     for (const cpu of cpus) {
-        user += cpu.times.user;
-        nice += cpu.times.nice;
-        sys += cpu.times.sys;
-        idle += cpu.times.idle;
-        irq += cpu.times.irq;
+        user += cpu.times.user; nice += cpu.times.nice; sys += cpu.times.sys; idle += cpu.times.idle; irq += cpu.times.irq;
     }
-
     const total = user + nice + sys + idle + irq;
     const usage = { total, idle };
-
     let percent = 0;
     if (previousCpuUsage) {
         const totalDiff = total - previousCpuUsage.total;
         const idleDiff = idle - previousCpuUsage.idle;
-        if (totalDiff > 0) {
-            percent = 100 - Math.round((idleDiff / totalDiff) * 100);
-        }
+        if (totalDiff > 0) percent = 100 - Math.round((idleDiff / totalDiff) * 100);
     }
     previousCpuUsage = usage;
     return percent;
 }
 
 function getNetworkTraffic() {
-    // Read /proc/net/dev for eth0 (or first non-lo interface)
     try {
         const data = fs.readFileSync('/proc/net/dev', 'utf8');
         const lines = data.split('\n');
@@ -132,10 +116,9 @@ function getNetworkTraffic() {
 const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, `http://${req.headers.host}`);
 
-    // AUTH CHECK (Middleware style)
+    // Auth Check
     const isPublic = url.pathname.startsWith("/sub") || url.pathname === '/login.html' || url.pathname === '/api/login';
     let isAuthenticated = false;
-
     const cookieHeader = req.headers.cookie;
     if (cookieHeader) {
         const cookies = cookieHeader.split(';').reduce((acc, c) => {
@@ -145,20 +128,10 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (url.pathname.startsWith('/api/') && url.pathname !== '/api/login') {
-        if (!isAuthenticated) {
-            res.writeHead(401);
-            res.end('Unauthorized');
-            return;
-        }
+        if (!isAuthenticated) { res.writeHead(401); res.end('Unauthorized'); return; }
     } else if (!isPublic && (url.pathname === '/' || url.pathname.endsWith('.html'))) {
-        if (!isAuthenticated) {
-            res.writeHead(302, { 'Location': '/login.html' });
-            res.end();
-            return;
-        }
+        if (!isAuthenticated) { res.writeHead(302, { 'Location': '/login.html' }); res.end(); return; }
     }
-
-    // --- API ROUTES ---
 
     // Login
     if (url.pathname === '/api/login' && req.method === 'POST') {
@@ -171,10 +144,7 @@ const server = http.createServer(async (req, res) => {
                 if (username === creds.adminUser && password === creds.adminPass) {
                     const token = randomUUID();
                     SESSIONS.set(token, { user: username, created: Date.now() });
-                    res.writeHead(200, {
-                        'Set-Cookie': `session_token=${token}; HttpOnly; Path=/; Max-Age=86400`,
-                        'Content-Type': 'application/json'
-                    });
+                    res.writeHead(200, { 'Set-Cookie': `session_token=${token}; HttpOnly; Path=/; Max-Age=86400`, 'Content-Type': 'application/json' });
                     res.end(JSON.stringify({ success: true }));
                 } else {
                     res.writeHead(401, { 'Content-Type': 'application/json' });
@@ -185,19 +155,12 @@ const server = http.createServer(async (req, res) => {
         return;
     }
 
-    // System Stats
+    // API Stats
     if (url.pathname === '/api/stats' && req.method === 'GET') {
         const stats = {
             ip: publicIP,
-            ram: {
-                total: os.totalmem(),
-                free: os.freemem(),
-                usage: Math.round(((os.totalmem() - os.freemem()) / os.totalmem()) * 100)
-            },
-            cpu: {
-                cores: os.cpus().length,
-                usage: getCpuUsage()
-            },
+            ram: { total: os.totalmem(), free: os.freemem(), usage: Math.round(((os.totalmem() - os.freemem()) / os.totalmem()) * 100) },
+            cpu: { cores: os.cpus().length, usage: getCpuUsage() },
             net: getNetworkTraffic()
         };
         res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -205,7 +168,7 @@ const server = http.createServer(async (req, res) => {
         return;
     }
 
-    // Settings: Domain
+    // Settings
     if (url.pathname === '/api/settings/domain' && req.method === 'POST') {
         let body = '';
         req.on('data', chunk => body += chunk);
@@ -213,22 +176,17 @@ const server = http.createServer(async (req, res) => {
             try {
                 const { domain } = JSON.parse(body);
                 if (!domain || !/^[a-zA-Z0-9.-]+$/.test(domain)) throw new Error("Invalid Domain");
-
                 const caddyFile = `${domain} {\n    reverse_proxy localhost:${PORT}\n}`;
                 fs.writeFileSync('/etc/caddy/Caddyfile', caddyFile);
                 exec('systemctl reload caddy', (err) => {
-                    if (err) {
-                        res.writeHead(500); res.end(JSON.stringify({ error: "Failed to reload Caddy" }));
-                    } else {
-                        res.writeHead(200); res.end(JSON.stringify({ success: true }));
-                    }
+                    if (err) { res.writeHead(500); res.end(JSON.stringify({ error: "Failed to reload Caddy" })); }
+                    else { res.writeHead(200); res.end(JSON.stringify({ success: true })); }
                 });
             } catch (e) { res.writeHead(400); res.end(JSON.stringify({ error: e.message })); }
         });
         return;
     }
 
-    // Settings: Password
     if (url.pathname === '/api/settings/password' && req.method === 'POST') {
         let body = '';
         req.on('data', chunk => body += chunk);
@@ -236,7 +194,6 @@ const server = http.createServer(async (req, res) => {
             try {
                 const { password } = JSON.parse(body);
                 if (!password) throw new Error("Missing password");
-
                 const creds = getAdminCredentials();
                 creds.adminPass = password;
                 fs.writeFileSync(CONFIG_FILE, JSON.stringify(creds, null, 2));
@@ -246,19 +203,16 @@ const server = http.createServer(async (req, res) => {
         return;
     }
 
-    // Settings: Reboot
     if (url.pathname === '/api/settings/reboot' && req.method === 'POST') {
         let body = '';
         req.on('data', chunk => body += chunk);
         req.on('end', () => {
             try {
-                const { time } = JSON.parse(body); // "00:00" format
-                if (!time || !/^\d{2}:\d{2}$/.test(time)) throw new Error("Invalid time format");
-
+                const { time } = JSON.parse(body);
+                if (!time || !/^\d{2}:\d{2}$/.test(time)) throw new Error("Invalid time");
                 const [h, m] = time.split(':');
-                // Remove existing reboot jobs and add new one
                 exec('crontab -l | grep -v "sbin/reboot"', (err, stdout) => {
-                    const newCron = `${stdout.trim()}\n${m} ${h} * * * /sbin/reboot\n`;
+                    const newCron = `${stdout ? stdout.trim() + '\n' : ''}${m} ${h} * * * /sbin/reboot\n`;
                     const p = exec('crontab -', (e) => {
                         if (e) { res.writeHead(500); res.end(JSON.stringify({ error: "Failed to update crontab" })); }
                         else { res.writeHead(200); res.end(JSON.stringify({ success: true })); }
@@ -271,21 +225,24 @@ const server = http.createServer(async (req, res) => {
         return;
     }
 
-    // Update System
+    // Update
     if (url.pathname === '/api/update' && req.method === 'POST') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        exec('git pull origin main', { cwd: __dirname }, (err, stdout, stderr) => {
+        // Force update code, but preserve config/users via .gitignore (handled by installer)
+        exec('git fetch --all && git reset --hard origin/main', { cwd: __dirname }, (err, stdout, stderr) => {
             if (err) {
-                res.end(JSON.stringify({ success: false, message: stderr }));
+                console.error(err);
+                res.end(JSON.stringify({ success: false, message: stderr || err.message }));
                 return;
             }
             res.end(JSON.stringify({ success: true, message: "Update successful. Restarting..." }));
-            setTimeout(() => process.exit(0), 1000);
+            // Increased timeout to ensure response is flushed
+            setTimeout(() => process.exit(0), 3000);
         });
         return;
     }
 
-    // Users API
+    // Users
     if (url.pathname === '/api/users') {
         if (req.method === 'GET') {
             res.writeHead(200, { ...CORS_HEADER_OPTIONS, 'Content-Type': 'application/json' });
@@ -301,10 +258,7 @@ const server = http.createServer(async (req, res) => {
                     saveUser(data);
                     res.writeHead(200, CORS_HEADER_OPTIONS);
                     res.end(JSON.stringify({ success: true }));
-                } catch (e) {
-                    res.writeHead(400, CORS_HEADER_OPTIONS);
-                    res.end(JSON.stringify({ error: e.message }));
-                }
+                } catch (e) { res.writeHead(400, CORS_HEADER_OPTIONS); res.end(JSON.stringify({ error: e.message })); }
             });
             return;
         }
@@ -318,7 +272,7 @@ const server = http.createServer(async (req, res) => {
         return;
     }
 
-    // Static Files
+    // Static
     let requestedPath = url.pathname === '/' ? '/index.html' : url.pathname;
     requestedPath = requestedPath.split('?')[0];
     const publicDir = path.join(__dirname, 'public');
@@ -350,152 +304,82 @@ async function websocketHandler(webSocket, request) {
 
     wsStream.once('data', async (chunk) => {
         wsStream.pause();
-
         try {
             const protocol = await protocolSniffer(chunk);
             let protocolHeader;
             let authenticated = false;
 
-            log(`Sniffed Protocol: ${protocol}`);
-
-            if (protocol === atob(horse)) { // Trojan
+            if (protocol === atob(horse)) {
                 protocolHeader = readHorseHeader(chunk);
-                if (!protocolHeader.hasError && isValidTrojanUser(protocolHeader.passwordHash)) {
-                    authenticated = true;
-                }
-            } else if (protocol === atob(neko)) { // VLESS
+                if (!protocolHeader.hasError && isValidTrojanUser(protocolHeader.passwordHash)) authenticated = true;
+            } else if (protocol === atob(neko)) {
                 protocolHeader = readNekoHeader(chunk);
                 const uuid = arrayBufferToHex(chunk.slice(1, 17));
                 const formattedUUID = `${uuid.substr(0,8)}-${uuid.substr(8,4)}-${uuid.substr(12,4)}-${uuid.substr(16,4)}-${uuid.substr(20,12)}`;
-                log(`VLESS UUID: ${formattedUUID}`);
-                if (isValidUser(formattedUUID)) {
-                    authenticated = true;
-                } else {
-                    log(`User not found in DB: ${formattedUUID}`);
-                }
-            } else if (protocol === atob(flash)) { // VMess
+                if (isValidUser(formattedUUID)) authenticated = true;
+            } else if (protocol === atob(flash)) {
                 const users = getUsers().filter(u => u.protocol === 'vmess');
                 for (const user of users) {
                     const result = await readStreamHeader(chunk, user.uuid);
-                    if (!result.hasError) {
-                        protocolHeader = result;
-                        authenticated = true;
-                        log(`VMess Auth Success: ${user.uuid}`);
-                        break;
-                    }
+                    if (!result.hasError) { protocolHeader = result; authenticated = true; break; }
                 }
-            } else {
-                throw new Error("Unknown Protocol");
-            }
+            } else throw new Error("Unknown Protocol");
 
-            if (!protocolHeader || protocolHeader.hasError) {
-                throw new Error(protocolHeader ? protocolHeader.message : "Header Parse Failed");
-            }
+            if (!protocolHeader || protocolHeader.hasError) throw new Error("Header Parse Failed");
+            if (!authenticated) { webSocket.close(); return; }
 
-            if (!authenticated) {
-                log("Authentication Failed");
-                webSocket.close();
-                return;
-            }
-
-            // 1. Send Response Header
             let responseHeader = protocolHeader.version;
             if (protocol === atob(flash) && protocolHeader.needsResponse) {
-                 responseHeader = await generateStreamResponseHeader(
-                    protocolHeader.responseOptions,
-                    protocolHeader.encKey,
-                    protocolHeader.encIv,
-                );
+                 responseHeader = await generateStreamResponseHeader(protocolHeader.responseOptions, protocolHeader.encKey, protocolHeader.encIv);
             }
 
-            if (responseHeader) {
-                wsStream.write(responseHeader);
-            }
+            if (responseHeader) wsStream.write(responseHeader);
 
-            // 2. Connect to Target (Direct)
             const targetHost = protocolHeader.addressRemote;
             const targetPort = protocolHeader.portRemote;
-            log(`Connecting to ${targetHost}:${targetPort}`);
 
             if (protocolHeader.isUDP) {
-                 await handleUDPOutbound(
-                    targetHost, targetPort, protocolHeader.rawClientData,
-                    webSocket, wsStream, log
-                 );
+                 await handleUDPOutbound(targetHost, targetPort, protocolHeader.rawClientData, webSocket, wsStream, log);
             } else {
-                await handleTCPOutbound(
-                    targetHost, targetPort, protocolHeader.rawClientData,
-                    webSocket, wsStream, log
-                );
+                await handleTCPOutbound(targetHost, targetPort, protocolHeader.rawClientData, webSocket, wsStream, log);
             }
-
-        } catch (err) {
-            log(`Handshake Error: ${err.message}`);
-            webSocket.close();
-        }
+        } catch (err) { webSocket.close(); }
     });
-
     wsStream.on('error', (err) => log(`Stream Error: ${err.message}`));
 }
 
 async function handleTCPOutbound(addressRemote, portRemote, rawClientData, webSocket, wsStream, log) {
-    async function connectTarget(addr, port) {
-        const s = net.connect(port, addr);
+    try {
+        const s = net.connect(portRemote, addressRemote);
         s.setNoDelay(true);
         s.setKeepAlive(true);
-        await new Promise((res, rej) => {
-            s.once('connect', res);
-            s.once('error', rej);
-        });
-        return { socket: s };
-    }
+        await new Promise((res, rej) => { s.once('connect', res); s.once('error', rej); });
 
-    try {
-        const { socket: tcpSocket } = await connectTarget(addressRemote, portRemote);
+        if (rawClientData && rawClientData.length > 0) s.write(rawClientData);
 
-        if (rawClientData && rawClientData.length > 0) {
-            tcpSocket.write(rawClientData);
-        }
-
-        wsStream.pipe(tcpSocket);
-        tcpSocket.pipe(wsStream);
-
+        wsStream.pipe(s);
+        s.pipe(wsStream);
         wsStream.resume();
-
-        tcpSocket.on('error', (e) => log(`TCP Error: ${e.message}`));
-        tcpSocket.on('close', () => {
-            log("TCP Closed");
-            webSocket.close();
-        });
-
-    } catch (e) {
-        log(`Outbound Failed: ${e.message}`);
-        webSocket.close();
-    }
+        s.on('close', () => webSocket.close());
+    } catch (e) { webSocket.close(); }
 }
 
 async function handleUDPOutbound(targetAddress, targetPort, dataChunk, webSocket, wsStream, log) {
-    log("UDP requested but Proxy/Relay system is removed. Closing.");
-    webSocket.close();
+    webSocket.close(); // UDP disabled as per previous request
 }
 
-// ... Protocol Logic (Sniffer/Reader) ...
+// ... Protocol Parsers (Same as before) ...
 async function protocolSniffer(buffer) {
     if (buffer.length >= 18 && buffer[0] === 0) return atob(neko);
-    if (buffer.length >= 62) {
-        const d = buffer.slice(56, 60);
-        if (d[0]===0x0d && d[1]===0x0a) return atob(horse);
-    }
+    if (buffer.length >= 62) { const d = buffer.slice(56, 60); if (d[0]===0x0d && d[1]===0x0a) return atob(horse); }
     if (buffer.length >= 42) return atob(flash);
     return "";
 }
-
 function readHorseHeader(buffer) {
     if (buffer.length < 58) return { hasError: true };
     const hash = buffer.slice(0, 56).toString();
     const data = buffer.slice(58);
     if (data.length < 6) return { hasError: true };
-
     const cmd = data[0];
     const atype = data[1];
     let off = 2;
@@ -504,11 +388,9 @@ function readHorseHeader(buffer) {
     else if (atype === 3) { const l = data[off]; off++; addr = data.slice(off, off+l).toString(); off+=l; }
     else if (atype === 4) { off+=16; addr="ipv6"; }
     else return { hasError: true };
-
     const port = data.readUInt16BE(off);
     return { hasError: false, addressRemote: addr, portRemote: port, isUDP: cmd===3, rawClientData: data.slice(off+2), passwordHash: hash };
 }
-
 function readNekoHeader(buffer) {
     const ver = buffer[0];
     const optLen = buffer[17];
@@ -521,10 +403,8 @@ function readNekoHeader(buffer) {
     if (atype === 1) { addr = buffer.slice(off, off+4).join('.'); off+=4; }
     else if (atype === 2) { const l = buffer[off]; off++; addr = buffer.slice(off, off+l).toString(); off+=l; }
     else if (atype === 3) { off+=16; addr="ipv6"; }
-
     return { hasError: false, addressRemote: addr, portRemote: port, isUDP: cmd===2, rawClientData: buffer.slice(off), version: new Uint8Array([ver, 0]) };
 }
-
 async function readStreamHeader(buffer, uuid) {
     try {
         const keyBytes = new Uint8Array(uuid.replace(/-/g, "").match(/.{1,2}/g).map(b => parseInt(b, 16)));
@@ -532,17 +412,14 @@ async function readStreamHeader(buffer, uuid) {
         const authId = buffer.slice(0, 16);
         const encLen = buffer.slice(16, 34);
         const nonce = buffer.slice(34, 42);
-
         const lKey = (await kdf(authKey, [SALT_A1, authId, nonce])).slice(0, 16);
         const lIv = (await kdf(authKey, [SALT_A2, authId, nonce])).slice(0, 12);
         const lBytes = await aesGcmDecrypt(lKey, lIv, encLen, authId);
         const hLen = (lBytes[0] << 8) | lBytes[1];
-
         const encHead = buffer.slice(42, 42 + hLen + 16);
         const pKey = (await kdf(authKey, [SALT_A3, authId, nonce])).slice(0, 16);
         const pIv = (await kdf(authKey, [SALT_A4, authId, nonce])).slice(0, 12);
         const head = await aesGcmDecrypt(pKey, pIv, encHead, authId);
-
         const view = Buffer.from(head);
         let off = 0;
         const ver = view[off++];
@@ -555,11 +432,9 @@ async function readStreamHeader(buffer, uuid) {
         let addr = "";
         if (atype === 1) { addr = view.slice(off, off+4).join('.'); off+=4; }
         else if (atype === 2) { const l = view[off++]; addr = view.slice(off, off+l).toString(); off+=l; }
-
         return { hasError: false, addressRemote: addr, portRemote: port, isUDP: cmd!==1, rawClientData: buffer.slice(42+hLen+16), version: new Uint8Array([opts[0], 0]), encKey, encIv, needsResponse: true, responseOptions: opts };
     } catch(e) { return { hasError: true, message: e.message }; }
 }
-
 async function generateStreamResponseHeader(opts, key, iv) {
     try {
         const sKey = (await sha256(key)).slice(0, 16);
@@ -568,16 +443,13 @@ async function generateStreamResponseHeader(opts, key, iv) {
         const rLenIv = (await kdf(sIv, [SALT_B2])).slice(0, 12);
         const rLenData = new Uint8Array([0, 4]);
         const encLen = await aesGcmEncrypt(rLenKey, rLenIv, rLenData, new Uint8Array(0));
-
         const rHead = new Uint8Array([opts[0], 0, 0, 0]);
         const rHeadKey = (await kdf(sKey, [SALT_B3])).slice(0, 16);
         const rHeadIv = (await kdf(sIv, [SALT_B4])).slice(0, 12);
         const encHead = await aesGcmEncrypt(rHeadKey, rHeadIv, rHead, new Uint8Array(0));
-
         return Buffer.concat([encLen, encHead]);
     } catch(e) { return Buffer.alloc(0); }
 }
-
 async function md5(...args) { return new Uint8Array(createHash('md5').update(Buffer.concat(args.map(a=>Buffer.from(a)))).digest()); }
 async function sha256(d) { return new Uint8Array(await crypto.subtle.digest("SHA-256", d)); }
 async function aesGcmDecrypt(k, n, d, a) {
@@ -594,10 +466,10 @@ async function kdf(key, path) {
         return new Uint8Array(await crypto.subtle.sign("HMAC", key, d));
     }
     let result = key;
-    for (const p of path) {
-        result = await hmac(result, p);
-    }
+    for (const p of path) { result = await hmac(result, p); }
     return result;
 }
+
+function arrayBufferToHex(buf) { return Buffer.from(buf).toString('hex'); }
 
 server.listen(PORT, () => { console.log(`Server running on ${PORT}`); });

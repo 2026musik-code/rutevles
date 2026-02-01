@@ -46,6 +46,14 @@ echo "[2/4] Generating application files..."
 INSTALL_DIR="/opt/nautica"
 mkdir -p $INSTALL_DIR/public
 
+# Generate .gitignore
+cat <<EOF > $INSTALL_DIR/.gitignore
+node_modules/
+config.json
+users.json
+public/
+EOF
+
 # Generate package.json
 cat <<EOF > $INSTALL_DIR/package.json
 {
@@ -297,10 +305,16 @@ const server = http.createServer(async (req, res) => {
     // Update
     if (url.pathname === '/api/update' && req.method === 'POST') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        exec('git pull origin main', { cwd: __dirname }, (err, stdout, stderr) => {
-            if (err) { res.end(JSON.stringify({ success: false, message: stderr })); return; }
+        // Force update code, but preserve config/users via .gitignore (handled by installer)
+        exec('git fetch --all && git reset --hard origin/main', { cwd: __dirname }, (err, stdout, stderr) => {
+            if (err) {
+                console.error(err);
+                res.end(JSON.stringify({ success: false, message: stderr || err.message }));
+                return;
+            }
             res.end(JSON.stringify({ success: true, message: "Update successful. Restarting..." }));
-            setTimeout(() => process.exit(0), 1000);
+            // Increased timeout to ensure response is flushed
+            setTimeout(() => process.exit(0), 3000);
         });
         return;
     }
@@ -1266,200 +1280,6 @@ cat <<'EOF' > $INSTALL_DIR/public/index.html
             div.innerHTML = `<span>${msg}</span>`;
             document.getElementById('toast-container').appendChild(div);
             setTimeout(() => div.remove(), 3000);
-        }
-    </script>
-</body>
-</html>
-EOF
-
-# Generate Login HTML
-cat <<'EOF' > $INSTALL_DIR/public/login.html
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>RUTE PREMIUM | Login</title>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body {
-            font-family: 'Inter', sans-serif;
-            background-color: #0f172a;
-            color: #f8fafc;
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            height: 100vh;
-            overflow: hidden;
-        }
-
-        .ambient {
-            position: absolute;
-            width: 100%;
-            height: 100%;
-            z-index: 1;
-            background: radial-gradient(circle at 50% 10%, rgba(59, 130, 246, 0.15) 0%, transparent 60%);
-        }
-
-        .login-card {
-            background-color: #1e293b;
-            border: 1px solid #334155;
-            padding: 40px;
-            border-radius: 16px;
-            width: 100%;
-            max-width: 400px;
-            z-index: 10;
-            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
-            animation: floatUp 0.6s cubic-bezier(0.2, 0.8, 0.2, 1);
-        }
-
-        @keyframes floatUp {
-            from { transform: translateY(20px); opacity: 0; }
-            to { transform: translateY(0); opacity: 1; }
-        }
-
-        .brand {
-            text-align: center;
-            margin-bottom: 8px;
-            font-size: 1.75rem;
-            font-weight: 700;
-            color: #3b82f6;
-            letter-spacing: -0.5px;
-        }
-
-        .subtitle {
-            text-align: center;
-            color: #94a3b8;
-            font-size: 0.9rem;
-            margin-bottom: 32px;
-        }
-
-        .form-group { margin-bottom: 20px; }
-        .form-group label {
-            display: block;
-            margin-bottom: 8px;
-            font-size: 0.85rem;
-            color: #94a3b8;
-        }
-        .form-group input {
-            width: 100%;
-            padding: 12px;
-            border-radius: 8px;
-            background-color: #0f172a;
-            border: 1px solid #334155;
-            color: white;
-            outline: none;
-            transition: border-color 0.2s;
-            font-family: inherit;
-        }
-        .form-group input:focus { border-color: #3b82f6; }
-
-        .btn {
-            width: 100%;
-            padding: 12px;
-            background-color: #3b82f6;
-            color: white;
-            border: none;
-            border-radius: 8px;
-            font-weight: 600;
-            cursor: pointer;
-            transition: background-color 0.2s;
-            margin-top: 10px;
-        }
-        .btn:hover { background-color: #2563eb; }
-
-        .error-msg {
-            color: #ef4444;
-            text-align: center;
-            margin-bottom: 20px;
-            font-size: 0.9rem;
-            display: none;
-        }
-
-        .contact-buttons {
-            display: flex;
-            gap: 12px;
-            margin-top: 24px;
-            padding-top: 24px;
-            border-top: 1px solid #334155;
-        }
-
-        .contact-btn {
-            flex: 1;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            gap: 8px;
-            padding: 10px;
-            border-radius: 8px;
-            text-decoration: none;
-            font-size: 0.9rem;
-            font-weight: 500;
-            transition: opacity 0.2s;
-        }
-        .contact-btn:hover { opacity: 0.8; }
-
-        .btn-wa { background-color: #25D366; color: white; }
-        .btn-tg { background-color: #0088cc; color: white; }
-
-    </style>
-</head>
-<body>
-    <div class="ambient"></div>
-    <div class="login-card">
-        <div class="brand">RUTE PREMIUM</div>
-        <div class="subtitle">Secure Tunneling System</div>
-
-        <div id="error" class="error-msg">Invalid credentials</div>
-
-        <form onsubmit="handleLogin(event)">
-            <div class="form-group">
-                <label>Username</label>
-                <input type="text" id="username" required autocomplete="off">
-            </div>
-            <div class="form-group">
-                <label>Password</label>
-                <input type="password" id="password" required>
-            </div>
-            <button type="submit" class="btn">Sign In</button>
-        </form>
-
-        <div class="contact-buttons">
-            <a href="https://wa.me/6287733745059" target="_blank" class="contact-btn btn-wa">
-                <i class="fa-brands fa-whatsapp"></i> WhatsApp
-            </a>
-            <a href="https://t.me/otomotif_digital" target="_blank" class="contact-btn btn-tg">
-                <i class="fa-brands fa-telegram"></i> Telegram
-            </a>
-        </div>
-    </div>
-
-    <script>
-        async function handleLogin(e) {
-            e.preventDefault();
-            const u = document.getElementById('username').value;
-            const p = document.getElementById('password').value;
-            const err = document.getElementById('error');
-
-            try {
-                const res = await fetch('/api/login', {
-                    method: 'POST',
-                    body: JSON.stringify({ username: u, password: p })
-                });
-                const data = await res.json();
-
-                if (data.success) {
-                    window.location.href = '/index.html';
-                } else {
-                    err.style.display = 'block';
-                    err.innerText = data.error || 'Login failed';
-                }
-            } catch {
-                err.style.display = 'block';
-                err.innerText = 'Connection error';
-            }
         }
     </script>
 </body>

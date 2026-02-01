@@ -159,7 +159,7 @@
             transition: width 0.5s ease;
         }
 
-        /* Traffic Bar */
+        /* Traffic Bar (Horizontal) */
         .traffic-card {
             background-color: var(--bg-panel);
             border: 1px solid var(--border);
@@ -168,15 +168,35 @@
             margin-bottom: 32px;
         }
         .traffic-header { display: flex; justify-content: space-between; margin-bottom: 16px; }
-        .traffic-bars { display: flex; height: 40px; gap: 4px; align-items: flex-end; }
-        .t-bar {
-            flex: 1;
-            background-color: rgba(59, 130, 246, 0.2);
-            border-radius: 2px;
-            transition: height 0.2s;
-            min-height: 4px;
+
+        .traffic-bar-container {
+            display: flex;
+            align-items: center;
+            gap: 16px;
         }
-        .t-bar.active { background-color: var(--primary); }
+        .traffic-bar-visual {
+            flex: 1;
+            background-color: var(--bg-input);
+            height: 24px;
+            border-radius: 6px;
+            overflow: hidden;
+            position: relative;
+        }
+        .traffic-bar-fill {
+            height: 100%;
+            background-color: var(--primary);
+            width: 0%;
+            transition: width 0.5s ease;
+            position: absolute;
+            left: 0; top: 0;
+        }
+        .traffic-stats-text {
+            font-family: monospace;
+            font-size: 1rem;
+            color: white;
+            min-width: 150px;
+            text-align: right;
+        }
 
         /* Table */
         .table-container {
@@ -358,7 +378,12 @@
                 <div class="stat-card">
                     <div class="stat-label">Public IP <i class="fa-solid fa-globe"></i></div>
                     <div class="stat-value" id="stat-ip" style="font-size: 1.2rem;">Loading...</div>
-                    <div class="stat-sub">VPS Address</div>
+                    <div class="stat-sub" id="stat-isp">ISP: Loading...</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Domain <i class="fa-solid fa-link"></i></div>
+                    <div class="stat-value" id="stat-domain" style="font-size: 1.2rem;">Loading...</div>
+                    <div class="stat-sub">VPS Domain</div>
                 </div>
                 <div class="stat-card">
                     <div class="stat-label">CPU Load <i class="fa-solid fa-microchip"></i></div>
@@ -372,20 +397,18 @@
                     <div class="progress-bg"><div class="progress-fill" id="prog-ram" style="width: 0%; background-color: var(--warning);"></div></div>
                     <div class="stat-sub" id="stat-mem-det">Loading...</div>
                 </div>
-                <div class="stat-card">
-                    <div class="stat-label">Network I/O <i class="fa-solid fa-network-wired"></i></div>
-                    <div class="stat-value" id="stat-net" style="font-size: 1.2rem;">0 KB/s</div>
-                    <div class="stat-sub">Total RX/TX</div>
-                </div>
             </div>
 
             <div class="traffic-card">
                 <div class="traffic-header">
                     <h3>Live Traffic</h3>
-                    <span style="color: var(--text-muted); font-size: 0.9rem;">Real-time Network Load (Mbps)</span>
+                    <span style="color: var(--text-muted); font-size: 0.9rem;">Real-time Network Load</span>
                 </div>
-                <div class="traffic-bars" id="traffic-bars">
-                    <!-- 30 bars generated via JS -->
+                <div class="traffic-bar-container">
+                    <div class="traffic-bar-visual">
+                        <div class="traffic-bar-fill" id="traffic-fill"></div>
+                    </div>
+                    <div class="traffic-stats-text" id="traffic-text">0 KB/s</div>
                 </div>
             </div>
 
@@ -511,7 +534,6 @@
         // Init
         document.addEventListener('DOMContentLoaded', () => {
             loadData();
-            initTrafficBar();
             startStatsLoop();
         });
 
@@ -546,8 +568,10 @@
                 if (!res.ok) return;
                 const data = await res.json();
 
-                // IP
-                document.getElementById('stat-ip').innerText = data.ip;
+                // Info
+                document.getElementById('stat-ip').innerText = data.info.ip;
+                document.getElementById('stat-isp').innerText = `ISP: ${data.info.isp}`;
+                document.getElementById('stat-domain').innerText = data.info.domain;
 
                 // CPU
                 document.getElementById('stat-cpu').innerText = data.cpu.usage + '%';
@@ -561,48 +585,22 @@
                 document.getElementById('prog-ram').style.width = data.ram.usage + '%';
                 document.getElementById('stat-mem-det').innerText = `${usedMem}GB / ${totalMem}GB`;
 
-                // Net
-                const txMbps = (data.net.tx / 1024 / 1024 * 8).toFixed(1); // approx since last boot, but we want rate?
-                // Note: /api/stats returns cumulative. We need to diff in JS to get rate.
-                // For simplicity, let's just show cumulative for now or implement rate logic in JS.
-                // Rate Logic:
+                // Net & Traffic Bar
                 if (window.lastNet) {
                     const diffTx = data.net.tx - window.lastNet.tx;
-                    const speed = ((diffTx / 2) / 1024).toFixed(1); // KB/s over 2s
-                    document.getElementById('stat-net').innerText = `${speed} KB/s`;
-                    updateTrafficBar(speed); // Visualize
+                    const diffRx = data.net.rx - window.lastNet.rx;
+                    const speedTx = ((diffTx / 2) / 1024).toFixed(1); // KB/s over 2s interval
+
+                    document.getElementById('traffic-text').innerText = `${speedTx} KB/s`;
+
+                    // Visual Horizontal Bar
+                    const maxSpeed = 5000; // 5MB/s scale
+                    const width = Math.min(100, (speedTx / maxSpeed) * 100);
+                    document.getElementById('traffic-fill').style.width = width + '%';
                 }
                 window.lastNet = data.net;
 
             } catch(e) { console.error(e); }
-        }
-
-        function initTrafficBar() {
-            const container = document.getElementById('traffic-bars');
-            for(let i=0; i<30; i++) {
-                const bar = document.createElement('div');
-                bar.className = 't-bar';
-                container.appendChild(bar);
-            }
-        }
-
-        function updateTrafficBar(kbs) {
-            const bars = document.querySelectorAll('.t-bar');
-            // Shift height logic simulates a scrolling chart
-            // Simple: just update a random bar? No, slide.
-            // Actually, let's just make the rightmost bar represent current load
-            // and shift values left.
-            // Simplified: Just randomize visual for "activity" based on load level
-            const load = Math.min(100, kbs / 10); // scale 1000KB/s = 100% height
-
-            // Shift heights
-            for(let i=0; i<bars.length-1; i++) {
-                bars[i].style.height = bars[i+1].style.height;
-                if (parseInt(bars[i].style.height) > 20) bars[i].classList.add('active');
-                else bars[i].classList.remove('active');
-            }
-            const last = bars[bars.length-1];
-            last.style.height = Math.max(4, load) + '%';
         }
 
         // --- Settings Actions ---
@@ -628,13 +626,18 @@
 
         // --- Existing User Logic ---
         async function updateSystem() {
-            if(!confirm("Update system from GitHub?")) return;
+            if(!confirm("Update system from GitHub? This will overwrite local changes.")) return;
             try {
                 showToast("Updating...", "success");
-                await fetch('/api/update', { method: 'POST' });
-                showToast("Done. Reloading...");
-                setTimeout(() => location.reload(), 3000);
-            } catch(e) { showToast("Error", "error"); }
+                const res = await fetch('/api/update', { method: 'POST' });
+                const data = await res.json();
+                if(data.success) {
+                    showToast(data.message);
+                    setTimeout(() => location.reload(), 3000);
+                } else {
+                    showToast("Update failed: " + data.message, "error");
+                }
+            } catch(e) { showToast("Update error: " + e.message, "error"); }
         }
 
         async function loadData() {

@@ -76,10 +76,35 @@ function getAdminCredentials() {
     try { return JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')); } catch { return { adminUser: 'admin', adminPass: 'admin' }; }
 }
 
-// Stats
+// --- Stats & Info ---
 let previousCpuUsage = null;
-let publicIP = "Loading...";
-exec('curl -s https://api.ipify.org', (err, stdout) => { if (!err) publicIP = stdout.trim(); });
+let sysInfo = {
+    ip: "Loading...",
+    isp: "Loading...",
+    city: "Loading...",
+    domain: "Loading..."
+};
+
+// Fetch IP/ISP
+exec('curl -s http://ip-api.com/json', (err, stdout) => {
+    if (!err) {
+        try {
+            const data = JSON.parse(stdout);
+            sysInfo.ip = data.query;
+            sysInfo.isp = data.isp;
+            sysInfo.city = data.city;
+        } catch {}
+    }
+});
+
+// Fetch Domain (from Caddyfile)
+function getDomain() {
+    try {
+        const caddy = fs.readFileSync('/etc/caddy/Caddyfile', 'utf8');
+        const match = caddy.match(/^([a-zA-Z0-9.-]+)\s*\{/);
+        return match ? match[1] : (process.env.DOMAIN_NAME || "Unknown");
+    } catch { return "Unknown"; }
+}
 
 function getCpuUsage() {
     const cpus = os.cpus();
@@ -158,7 +183,10 @@ const server = http.createServer(async (req, res) => {
     // API Stats
     if (url.pathname === '/api/stats' && req.method === 'GET') {
         const stats = {
-            ip: publicIP,
+            info: {
+                ...sysInfo,
+                domain: getDomain()
+            },
             ram: { total: os.totalmem(), free: os.freemem(), usage: Math.round(((os.totalmem() - os.freemem()) / os.totalmem()) * 100) },
             cpu: { cores: os.cpus().length, usage: getCpuUsage() },
             net: getNetworkTraffic()
@@ -225,10 +253,9 @@ const server = http.createServer(async (req, res) => {
         return;
     }
 
-    // Update
+    // Update (FIXED LOGIC)
     if (url.pathname === '/api/update' && req.method === 'POST') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        // Force update code, but preserve config/users via .gitignore (handled by installer)
         exec('git fetch --all && git reset --hard origin/main', { cwd: __dirname }, (err, stdout, stderr) => {
             if (err) {
                 console.error(err);
@@ -236,7 +263,6 @@ const server = http.createServer(async (req, res) => {
                 return;
             }
             res.end(JSON.stringify({ success: true, message: "Update successful. Restarting..." }));
-            // Increased timeout to ensure response is flushed
             setTimeout(() => process.exit(0), 3000);
         });
         return;
@@ -365,10 +391,10 @@ async function handleTCPOutbound(addressRemote, portRemote, rawClientData, webSo
 }
 
 async function handleUDPOutbound(targetAddress, targetPort, dataChunk, webSocket, wsStream, log) {
-    webSocket.close(); // UDP disabled as per previous request
+    webSocket.close();
 }
 
-// ... Protocol Parsers (Same as before) ...
+// ... Protocol Parsers ...
 async function protocolSniffer(buffer) {
     if (buffer.length >= 18 && buffer[0] === 0) return atob(neko);
     if (buffer.length >= 62) { const d = buffer.slice(56, 60); if (d[0]===0x0d && d[1]===0x0a) return atob(horse); }

@@ -153,10 +153,35 @@ function getAdminCredentials() {
     try { return JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')); } catch { return { adminUser: 'admin', adminPass: 'admin' }; }
 }
 
-// Stats
+// --- Stats & Info ---
 let previousCpuUsage = null;
-let publicIP = "Loading...";
-exec('curl -s https://api.ipify.org', (err, stdout) => { if (!err) publicIP = stdout.trim(); });
+let sysInfo = {
+    ip: "Loading...",
+    isp: "Loading...",
+    city: "Loading...",
+    domain: "Loading..."
+};
+
+// Fetch IP/ISP
+exec('curl -s http://ip-api.com/json', (err, stdout) => {
+    if (!err) {
+        try {
+            const data = JSON.parse(stdout);
+            sysInfo.ip = data.query;
+            sysInfo.isp = data.isp;
+            sysInfo.city = data.city;
+        } catch {}
+    }
+});
+
+// Fetch Domain (from Caddyfile)
+function getDomain() {
+    try {
+        const caddy = fs.readFileSync('/etc/caddy/Caddyfile', 'utf8');
+        const match = caddy.match(/^([a-zA-Z0-9.-]+)\s*\{/);
+        return match ? match[1] : (process.env.DOMAIN_NAME || "Unknown");
+    } catch { return "Unknown"; }
+}
 
 function getCpuUsage() {
     const cpus = os.cpus();
@@ -235,7 +260,10 @@ const server = http.createServer(async (req, res) => {
     // API Stats
     if (url.pathname === '/api/stats' && req.method === 'GET') {
         const stats = {
-            ip: publicIP,
+            info: {
+                ...sysInfo,
+                domain: getDomain()
+            },
             ram: { total: os.totalmem(), free: os.freemem(), usage: Math.round(((os.totalmem() - os.freemem()) / os.totalmem()) * 100) },
             cpu: { cores: os.cpus().length, usage: getCpuUsage() },
             net: getNetworkTraffic()
@@ -302,10 +330,9 @@ const server = http.createServer(async (req, res) => {
         return;
     }
 
-    // Update
+    // Update (FIXED LOGIC)
     if (url.pathname === '/api/update' && req.method === 'POST') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        // Force update code, but preserve config/users via .gitignore (handled by installer)
         exec('git fetch --all && git reset --hard origin/main', { cwd: __dirname }, (err, stdout, stderr) => {
             if (err) {
                 console.error(err);
@@ -313,7 +340,6 @@ const server = http.createServer(async (req, res) => {
                 return;
             }
             res.end(JSON.stringify({ success: true, message: "Update successful. Restarting..." }));
-            // Increased timeout to ensure response is flushed
             setTimeout(() => process.exit(0), 3000);
         });
         return;
@@ -442,10 +468,10 @@ async function handleTCPOutbound(addressRemote, portRemote, rawClientData, webSo
 }
 
 async function handleUDPOutbound(targetAddress, targetPort, dataChunk, webSocket, wsStream, log) {
-    webSocket.close(); // UDP disabled as per previous request
+    webSocket.close();
 }
 
-// ... Protocol Parsers (Same as before) ...
+// ... Protocol Parsers ...
 async function protocolSniffer(buffer) {
     if (buffer.length >= 18 && buffer[0] === 0) return atob(neko);
     if (buffer.length >= 62) { const d = buffer.slice(56, 60); if (d[0]===0x0d && d[1]===0x0a) return atob(horse); }
@@ -715,7 +741,7 @@ cat <<'EOF' > $INSTALL_DIR/public/index.html
             transition: width 0.5s ease;
         }
 
-        /* Traffic Bar */
+        /* Traffic Bar (Horizontal) */
         .traffic-card {
             background-color: var(--bg-panel);
             border: 1px solid var(--border);
@@ -724,15 +750,35 @@ cat <<'EOF' > $INSTALL_DIR/public/index.html
             margin-bottom: 32px;
         }
         .traffic-header { display: flex; justify-content: space-between; margin-bottom: 16px; }
-        .traffic-bars { display: flex; height: 40px; gap: 4px; align-items: flex-end; }
-        .t-bar {
-            flex: 1;
-            background-color: rgba(59, 130, 246, 0.2);
-            border-radius: 2px;
-            transition: height 0.2s;
-            min-height: 4px;
+
+        .traffic-bar-container {
+            display: flex;
+            align-items: center;
+            gap: 16px;
         }
-        .t-bar.active { background-color: var(--primary); }
+        .traffic-bar-visual {
+            flex: 1;
+            background-color: var(--bg-input);
+            height: 24px;
+            border-radius: 6px;
+            overflow: hidden;
+            position: relative;
+        }
+        .traffic-bar-fill {
+            height: 100%;
+            background-color: var(--primary);
+            width: 0%;
+            transition: width 0.5s ease;
+            position: absolute;
+            left: 0; top: 0;
+        }
+        .traffic-stats-text {
+            font-family: monospace;
+            font-size: 1rem;
+            color: white;
+            min-width: 150px;
+            text-align: right;
+        }
 
         /* Table */
         .table-container {
@@ -914,7 +960,12 @@ cat <<'EOF' > $INSTALL_DIR/public/index.html
                 <div class="stat-card">
                     <div class="stat-label">Public IP <i class="fa-solid fa-globe"></i></div>
                     <div class="stat-value" id="stat-ip" style="font-size: 1.2rem;">Loading...</div>
-                    <div class="stat-sub">VPS Address</div>
+                    <div class="stat-sub" id="stat-isp">ISP: Loading...</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Domain <i class="fa-solid fa-link"></i></div>
+                    <div class="stat-value" id="stat-domain" style="font-size: 1.2rem;">Loading...</div>
+                    <div class="stat-sub">VPS Domain</div>
                 </div>
                 <div class="stat-card">
                     <div class="stat-label">CPU Load <i class="fa-solid fa-microchip"></i></div>
@@ -928,20 +979,18 @@ cat <<'EOF' > $INSTALL_DIR/public/index.html
                     <div class="progress-bg"><div class="progress-fill" id="prog-ram" style="width: 0%; background-color: var(--warning);"></div></div>
                     <div class="stat-sub" id="stat-mem-det">Loading...</div>
                 </div>
-                <div class="stat-card">
-                    <div class="stat-label">Network I/O <i class="fa-solid fa-network-wired"></i></div>
-                    <div class="stat-value" id="stat-net" style="font-size: 1.2rem;">0 KB/s</div>
-                    <div class="stat-sub">Total RX/TX</div>
-                </div>
             </div>
 
             <div class="traffic-card">
                 <div class="traffic-header">
                     <h3>Live Traffic</h3>
-                    <span style="color: var(--text-muted); font-size: 0.9rem;">Real-time Network Load (Mbps)</span>
+                    <span style="color: var(--text-muted); font-size: 0.9rem;">Real-time Network Load</span>
                 </div>
-                <div class="traffic-bars" id="traffic-bars">
-                    <!-- 30 bars generated via JS -->
+                <div class="traffic-bar-container">
+                    <div class="traffic-bar-visual">
+                        <div class="traffic-bar-fill" id="traffic-fill"></div>
+                    </div>
+                    <div class="traffic-stats-text" id="traffic-text">0 KB/s</div>
                 </div>
             </div>
 
@@ -1067,7 +1116,6 @@ cat <<'EOF' > $INSTALL_DIR/public/index.html
         // Init
         document.addEventListener('DOMContentLoaded', () => {
             loadData();
-            initTrafficBar();
             startStatsLoop();
         });
 
@@ -1102,8 +1150,10 @@ cat <<'EOF' > $INSTALL_DIR/public/index.html
                 if (!res.ok) return;
                 const data = await res.json();
 
-                // IP
-                document.getElementById('stat-ip').innerText = data.ip;
+                // Info
+                document.getElementById('stat-ip').innerText = data.info.ip;
+                document.getElementById('stat-isp').innerText = `ISP: ${data.info.isp}`;
+                document.getElementById('stat-domain').innerText = data.info.domain;
 
                 // CPU
                 document.getElementById('stat-cpu').innerText = data.cpu.usage + '%';
@@ -1117,48 +1167,22 @@ cat <<'EOF' > $INSTALL_DIR/public/index.html
                 document.getElementById('prog-ram').style.width = data.ram.usage + '%';
                 document.getElementById('stat-mem-det').innerText = `${usedMem}GB / ${totalMem}GB`;
 
-                // Net
-                const txMbps = (data.net.tx / 1024 / 1024 * 8).toFixed(1); // approx since last boot, but we want rate?
-                // Note: /api/stats returns cumulative. We need to diff in JS to get rate.
-                // For simplicity, let's just show cumulative for now or implement rate logic in JS.
-                // Rate Logic:
+                // Net & Traffic Bar
                 if (window.lastNet) {
                     const diffTx = data.net.tx - window.lastNet.tx;
-                    const speed = ((diffTx / 2) / 1024).toFixed(1); // KB/s over 2s
-                    document.getElementById('stat-net').innerText = `${speed} KB/s`;
-                    updateTrafficBar(speed); // Visualize
+                    const diffRx = data.net.rx - window.lastNet.rx;
+                    const speedTx = ((diffTx / 2) / 1024).toFixed(1); // KB/s over 2s interval
+
+                    document.getElementById('traffic-text').innerText = `${speedTx} KB/s`;
+
+                    // Visual Horizontal Bar
+                    const maxSpeed = 5000; // 5MB/s scale
+                    const width = Math.min(100, (speedTx / maxSpeed) * 100);
+                    document.getElementById('traffic-fill').style.width = width + '%';
                 }
                 window.lastNet = data.net;
 
             } catch(e) { console.error(e); }
-        }
-
-        function initTrafficBar() {
-            const container = document.getElementById('traffic-bars');
-            for(let i=0; i<30; i++) {
-                const bar = document.createElement('div');
-                bar.className = 't-bar';
-                container.appendChild(bar);
-            }
-        }
-
-        function updateTrafficBar(kbs) {
-            const bars = document.querySelectorAll('.t-bar');
-            // Shift height logic simulates a scrolling chart
-            // Simple: just update a random bar? No, slide.
-            // Actually, let's just make the rightmost bar represent current load
-            // and shift values left.
-            // Simplified: Just randomize visual for "activity" based on load level
-            const load = Math.min(100, kbs / 10); // scale 1000KB/s = 100% height
-
-            // Shift heights
-            for(let i=0; i<bars.length-1; i++) {
-                bars[i].style.height = bars[i+1].style.height;
-                if (parseInt(bars[i].style.height) > 20) bars[i].classList.add('active');
-                else bars[i].classList.remove('active');
-            }
-            const last = bars[bars.length-1];
-            last.style.height = Math.max(4, load) + '%';
         }
 
         // --- Settings Actions ---
@@ -1184,13 +1208,18 @@ cat <<'EOF' > $INSTALL_DIR/public/index.html
 
         // --- Existing User Logic ---
         async function updateSystem() {
-            if(!confirm("Update system from GitHub?")) return;
+            if(!confirm("Update system from GitHub? This will overwrite local changes.")) return;
             try {
                 showToast("Updating...", "success");
-                await fetch('/api/update', { method: 'POST' });
-                showToast("Done. Reloading...");
-                setTimeout(() => location.reload(), 3000);
-            } catch(e) { showToast("Error", "error"); }
+                const res = await fetch('/api/update', { method: 'POST' });
+                const data = await res.json();
+                if(data.success) {
+                    showToast(data.message);
+                    setTimeout(() => location.reload(), 3000);
+                } else {
+                    showToast("Update failed: " + data.message, "error");
+                }
+            } catch(e) { showToast("Update error: " + e.message, "error"); }
         }
 
         async function loadData() {
@@ -1280,6 +1309,200 @@ cat <<'EOF' > $INSTALL_DIR/public/index.html
             div.innerHTML = `<span>${msg}</span>`;
             document.getElementById('toast-container').appendChild(div);
             setTimeout(() => div.remove(), 3000);
+        }
+    </script>
+</body>
+</html>
+EOF
+
+# Generate Login HTML (reusing previous correct version)
+cat <<'EOF' > $INSTALL_DIR/public/login.html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RUTE PREMIUM | Login</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #0f172a;
+            color: #f8fafc;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            overflow: hidden;
+        }
+
+        .ambient {
+            position: absolute;
+            width: 100%;
+            height: 100%;
+            z-index: 1;
+            background: radial-gradient(circle at 50% 10%, rgba(59, 130, 246, 0.15) 0%, transparent 60%);
+        }
+
+        .login-card {
+            background-color: #1e293b;
+            border: 1px solid #334155;
+            padding: 40px;
+            border-radius: 16px;
+            width: 100%;
+            max-width: 400px;
+            z-index: 10;
+            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
+            animation: floatUp 0.6s cubic-bezier(0.2, 0.8, 0.2, 1);
+        }
+
+        @keyframes floatUp {
+            from { transform: translateY(20px); opacity: 0; }
+            to { transform: translateY(0); opacity: 1; }
+        }
+
+        .brand {
+            text-align: center;
+            margin-bottom: 8px;
+            font-size: 1.75rem;
+            font-weight: 700;
+            color: #3b82f6;
+            letter-spacing: -0.5px;
+        }
+
+        .subtitle {
+            text-align: center;
+            color: #94a3b8;
+            font-size: 0.9rem;
+            margin-bottom: 32px;
+        }
+
+        .form-group { margin-bottom: 20px; }
+        .form-group label {
+            display: block;
+            margin-bottom: 8px;
+            font-size: 0.85rem;
+            color: #94a3b8;
+        }
+        .form-group input {
+            width: 100%;
+            padding: 12px;
+            border-radius: 8px;
+            background-color: #0f172a;
+            border: 1px solid #334155;
+            color: white;
+            outline: none;
+            transition: border-color 0.2s;
+            font-family: inherit;
+        }
+        .form-group input:focus { border-color: #3b82f6; }
+
+        .btn {
+            width: 100%;
+            padding: 12px;
+            background-color: #3b82f6;
+            color: white;
+            border: none;
+            border-radius: 8px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background-color 0.2s;
+            margin-top: 10px;
+        }
+        .btn:hover { background-color: #2563eb; }
+
+        .error-msg {
+            color: #ef4444;
+            text-align: center;
+            margin-bottom: 20px;
+            font-size: 0.9rem;
+            display: none;
+        }
+
+        .contact-buttons {
+            display: flex;
+            gap: 12px;
+            margin-top: 24px;
+            padding-top: 24px;
+            border-top: 1px solid #334155;
+        }
+
+        .contact-btn {
+            flex: 1;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+            padding: 10px;
+            border-radius: 8px;
+            text-decoration: none;
+            font-size: 0.9rem;
+            font-weight: 500;
+            transition: opacity 0.2s;
+        }
+        .contact-btn:hover { opacity: 0.8; }
+
+        .btn-wa { background-color: #25D366; color: white; }
+        .btn-tg { background-color: #0088cc; color: white; }
+
+    </style>
+</head>
+<body>
+    <div class="ambient"></div>
+    <div class="login-card">
+        <div class="brand">RUTE PREMIUM</div>
+        <div class="subtitle">Secure Tunneling System</div>
+
+        <div id="error" class="error-msg">Invalid credentials</div>
+
+        <form onsubmit="handleLogin(event)">
+            <div class="form-group">
+                <label>Username</label>
+                <input type="text" id="username" required autocomplete="off">
+            </div>
+            <div class="form-group">
+                <label>Password</label>
+                <input type="password" id="password" required>
+            </div>
+            <button type="submit" class="btn">Sign In</button>
+        </form>
+
+        <div class="contact-buttons">
+            <a href="https://wa.me/6287733745059" target="_blank" class="contact-btn btn-wa">
+                <i class="fa-brands fa-whatsapp"></i> WhatsApp
+            </a>
+            <a href="https://t.me/otomotif_digital" target="_blank" class="contact-btn btn-tg">
+                <i class="fa-brands fa-telegram"></i> Telegram
+            </a>
+        </div>
+    </div>
+
+    <script>
+        async function handleLogin(e) {
+            e.preventDefault();
+            const u = document.getElementById('username').value;
+            const p = document.getElementById('password').value;
+            const err = document.getElementById('error');
+
+            try {
+                const res = await fetch('/api/login', {
+                    method: 'POST',
+                    body: JSON.stringify({ username: u, password: p })
+                });
+                const data = await res.json();
+
+                if (data.success) {
+                    window.location.href = '/index.html';
+                } else {
+                    err.style.display = 'block';
+                    err.innerText = data.error || 'Login failed';
+                }
+            } catch {
+                err.style.display = 'block';
+                err.innerText = 'Connection error';
+            }
         }
     </script>
 </body>
